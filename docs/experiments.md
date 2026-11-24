@@ -10329,6 +10329,7 @@ On success the caller exits with `0x8AC`, also with `CPU_CRC_TEST_LIVE_WORKER=1`
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_acphal_hal$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_acphal_hal$' -V
+```
 
 ### ApuFree in the AcpHal stand-in
 
