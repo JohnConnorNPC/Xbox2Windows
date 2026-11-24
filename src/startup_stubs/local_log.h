@@ -50,6 +50,16 @@ inline bool first_calls(volatile LONG& counter, LONG limit) noexcept
     return false;
 }
 
+// Seconds since this process was created: one time base for lines from different stand-in DLLs.
+inline double process_seconds() noexcept
+{
+    FILETIME created{}, exited{}, kernel{}, user{}, now{};
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
+    GetSystemTimeAsFileTime(&now);
+    const auto ticks = [](const FILETIME& t) { return (std::uint64_t{t.dwHighDateTime} << 32) | t.dwLowDateTime; };
+    return ticks(now) > ticks(created) ? static_cast<double>(ticks(now) - ticks(created)) / 1e7 : 0.0;
+}
+
 // Number of contiguous readable bytes at start, up to bytes, found by touching one byte per page.
 // VirtualQuery is not used for this: on the title's multi-gigabyte regions one query takes about a
 // millisecond (it walks the region to size it). A bad pointer costs a first-chance exception, so

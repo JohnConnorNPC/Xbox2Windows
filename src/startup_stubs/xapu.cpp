@@ -214,6 +214,74 @@ long decode_packet(Connection& conn, const unsigned char* c, std::uint32_t& byte
     return hr_ok;
 }
 #endif
+
+// Activity counter (#1145), off unless X2W_AUDIO_ACTIVITY=1: every XApuEnqueueCommand call, counted by command class,
+// taken as the first UINT32 of the command (a stand-in convention, like the result type above), with no cap.
+// Classes 0..15 are counted one by one and larger ones together; a command that cannot be read and a call with an
+// unknown handle are counted apart. Once a second, if a count moved, one line gives the counts since the previous
+// line. Off, nothing here runs: no thread, no read of the command, no line.
+constexpr unsigned command_classes = 16;
+struct CommandCounts {
+    u64 by_class[command_classes + 1];  // the last entry: every larger class
+    u64 unreadable, rejected;
+};
+SRWLOCK count_lock = SRWLOCK_INIT;  // guards the two below
+CommandCounts command_counts;
+bool counting_started;
+
+bool activity_on() noexcept { return x2w_local::env_on("X2W_AUDIO_ACTIVITY"); }
+
+DWORD WINAPI activity_thread(void*)
+{
+    CommandCounts reported{};
+    for (;;) {
+        Sleep(1000);
+        AcquireSRWLockShared(&count_lock);
+        const CommandCounts now = command_counts;
+        ReleaseSRWLockShared(&count_lock);
+        if (!std::memcmp(&now, &reported, sizeof(now))) continue;
+        char classes[320] = "";
+        std::size_t used = 0;
+        u64 commands = now.unreadable - reported.unreadable;
+        for (unsigned c = 0; c <= command_classes; ++c) {
+            const u64 n = now.by_class[c] - reported.by_class[c];
+            commands += n;
+            if (!n || used >= sizeof(classes)) continue;
+            used += static_cast<std::size_t>(c < command_classes ? std::snprintf(classes + used, sizeof(classes) - used, " %u=%llu", c, n)
+                                                                 : std::snprintf(classes + used, sizeof(classes) - used, " other=%llu", n));
+        }
+        x2w_local::logf("x2w-audio xapu-activity t=%.1f s: commands=%llu by class%s unreadable=%llu; rejected=%llu",
+                        x2w_local::process_seconds(), commands, classes, now.unreadable - reported.unreadable,
+                        now.rejected - reported.rejected);
+        reported = now;
+    }
+}
+
+// Counts one XApuEnqueueCommand call; the caller's last error is kept.
+void count_command(long hr, const void* command) noexcept
+{
+    if (!activity_on()) return;
+    const DWORD error = GetLastError();
+    const bool readable = hr != hr_handle && x2w_local::readable(command, sizeof(std::uint32_t));
+    const std::uint32_t command_class = readable ? *static_cast<const std::uint32_t*>(command) : 0;
+    AcquireSRWLockExclusive(&count_lock);
+    if (hr == hr_handle)
+        ++command_counts.rejected;
+    else if (!readable)
+        ++command_counts.unreadable;
+    else
+        ++command_counts.by_class[command_class < command_classes ? command_class : command_classes];
+    const bool start = !counting_started;
+    counting_started = true;
+    ReleaseSRWLockExclusive(&count_lock);
+    if (start) {
+        if (HANDLE thread = CreateThread(nullptr, 0, activity_thread, nullptr, 0, nullptr))
+            CloseHandle(thread);
+        else
+            x2w_local::logf("x2w-audio xapu-activity: report thread not started (error %lu)", GetLastError());
+    }
+    SetLastError(error);
+}
 }  // namespace
 
 extern "C" __declspec(noinline) long XApuConnect(u64 rcx, u64 rdx, u64 r8, u64 r9)
@@ -359,6 +427,7 @@ extern "C" __declspec(noinline) long XApuEnqueueCommand(u64 rcx, u64 rdx, u64 r8
 #endif
     }
     ReleaseSRWLockExclusive(&connection_lock);
+    count_command(hr, reinterpret_cast<const void*>(rdx));
     static LONG calls;
     if (x2w_local::first_calls(calls, 24)) {
         char command[3 * 0x60 + 1];
@@ -396,4 +465,23 @@ extern "C" __declspec(noinline) long XApuDisconnect(u64 rcx, u64 rdx, u64 r8, u6
     delete conn;
     x2w_local::logf("x2w-audio XApuDisconnect handle=0x%llx -> S_OK", rcx);
     return hr_ok;
+}
+
+// Experimental export for the source-built check (tests/startup_acphal_xma_activity.cpp): writes the totals since
+// start to out[0..18]: commands of classes 0..15, of larger classes, unreadable commands, calls with an unknown
+// handle. With X2W_AUDIO_ACTIVITY off it writes zeros and returns FALSE.
+extern "C" BOOL WINAPI x2w_xapu_command_counts(ULONGLONG* out)
+{
+    if (!out) return FALSE;
+    const bool on = activity_on();
+    CommandCounts now{};
+    if (on) {
+        AcquireSRWLockShared(&count_lock);
+        now = command_counts;
+        ReleaseSRWLockShared(&count_lock);
+    }
+    for (unsigned c = 0; c <= command_classes; ++c) out[c] = now.by_class[c];
+    out[command_classes + 1] = now.unreadable;
+    out[command_classes + 2] = now.rejected;
+    return on;
 }
