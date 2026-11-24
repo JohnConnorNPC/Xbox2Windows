@@ -583,6 +583,144 @@ bool dstorage_checks() {
         }
     }
 
+    // Control: interleaved requests for distinct files in a single submission continue their own streams
+    // and correctly parse intermediate_size at +0x34 with +0x38 left as zero tag (Refs #1198)
+    {
+        const size_t plain1_size = 128 * 1024;
+        const size_t plain2_size = 64 * 1024;
+        const auto comp1 = make_fixed_deflate_zlib(0x41, plain1_size);
+        const auto comp2 = make_fixed_deflate_zlib(0x42, plain2_size);
+
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file1[MAX_PATH], temp_file2[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file1)) return false;
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file2)) {
+            DeleteFileW(temp_file1);
+            return false;
+        }
+
+        HANDLE h1 = CreateFileW(temp_file1, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        HANDLE h2 = CreateFileW(temp_file2, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h1 == INVALID_HANDLE_VALUE || h2 == INVALID_HANDLE_VALUE) {
+            if (h1 != INVALID_HANDLE_VALUE) CloseHandle(h1);
+            if (h2 != INVALID_HANDLE_VALUE) CloseHandle(h2);
+            DeleteFileW(temp_file1);
+            DeleteFileW(temp_file2);
+            return false;
+        }
+        DWORD written = 0;
+        WriteFile(h1, comp1.data(), static_cast<DWORD>(comp1.size()), &written, nullptr);
+        WriteFile(h2, comp2.data(), static_cast<DWORD>(comp2.size()), &written, nullptr);
+        CloseHandle(h1);
+        CloseHandle(h2);
+
+        void* file_ptr1 = nullptr;
+        void* file_ptr2 = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file1, nullptr, &file_ptr1) != 0 || !file_ptr1 ||
+            reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file2, nullptr, &file_ptr2) != 0 || !file_ptr2) {
+            if (file_ptr1) reinterpret_cast<CloseFileFn>(static_cast<Object*>(file_ptr1)->vtable[3])(static_cast<Object*>(file_ptr1));
+            DeleteFileW(temp_file1);
+            DeleteFileW(temp_file2);
+            return false;
+        }
+        auto* file_obj1 = static_cast<Object*>(file_ptr1);
+        auto* file_obj2 = static_cast<Object*>(file_ptr2);
+
+        void* status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 3, "InterleavedStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj1->vtable[3])(file_obj1);
+            reinterpret_cast<CloseFileFn>(file_obj2->vtable[3])(file_obj2);
+            DeleteFileW(temp_file1);
+            DeleteFileW(temp_file2);
+            return false;
+        }
+        auto* status = static_cast<Object*>(status_ptr);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj1->vtable[3])(file_obj1);
+            reinterpret_cast<CloseFileFn>(file_obj2->vtable[3])(file_obj2);
+            DeleteFileW(temp_file1);
+            DeleteFileW(temp_file2);
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        std::vector<unsigned char> dest1_0(64 * 1024, 0);
+        std::vector<unsigned char> dest2(64 * 1024, 0);
+        std::vector<unsigned char> dest1_1(64 * 1024, 0);
+
+        // Request 0: file 1 piece 0 (offset 0, 64 KiB destination). intermediate_size at +0x34 is 128 KiB. +0x38 is 0 (tag).
+        unsigned char req1_0[0x48] = {};
+        *reinterpret_cast<u64*>(req1_0 + 0x00) = 1;
+        *reinterpret_cast<void**>(req1_0 + 0x08) = dest1_0.data();
+        *reinterpret_cast<unsigned*>(req1_0 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req1_0 + 0x20) = file_obj1;
+        *reinterpret_cast<u64*>(req1_0 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req1_0 + 0x30) = static_cast<unsigned>(comp1.size());
+        *reinterpret_cast<unsigned*>(req1_0 + 0x34) = static_cast<unsigned>(plain1_size);
+        *reinterpret_cast<u64*>(req1_0 + 0x38) = 0;
+
+        // Request 1: file 2 (offset 0, 64 KiB destination). Interleaved request for a different file in the same submission!
+        unsigned char req2[0x48] = {};
+        *reinterpret_cast<u64*>(req2 + 0x00) = 1;
+        *reinterpret_cast<void**>(req2 + 0x08) = dest2.data();
+        *reinterpret_cast<unsigned*>(req2 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req2 + 0x20) = file_obj2;
+        *reinterpret_cast<u64*>(req2 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req2 + 0x30) = static_cast<unsigned>(comp2.size());
+        *reinterpret_cast<unsigned*>(req2 + 0x34) = static_cast<unsigned>(plain2_size);
+        *reinterpret_cast<u64*>(req2 + 0x38) = 0;
+
+        // Request 2: file 1 piece 1 (offset 64 KiB, 64 KiB destination). Continuation of file 1!
+        unsigned char req1_1[0x48] = {};
+        *reinterpret_cast<u64*>(req1_1 + 0x00) = 1;
+        *reinterpret_cast<void**>(req1_1 + 0x08) = dest1_1.data();
+        *reinterpret_cast<unsigned*>(req1_1 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req1_1 + 0x20) = file_obj1;
+        *reinterpret_cast<u64*>(req1_1 + 0x28) = 64 * 1024;
+        *reinterpret_cast<unsigned*>(req1_1 + 0x30) = static_cast<unsigned>(comp1.size());
+        *reinterpret_cast<unsigned*>(req1_1 + 0x34) = static_cast<unsigned>(plain1_size);
+        *reinterpret_cast<u64*>(req1_1 + 0x38) = 0;
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1_0);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req2);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1_1);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 2);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) break;
+            Sleep(10);
+        }
+        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) {
+            reinterpret_cast<CloseFileFn>(file_obj1->vtable[3])(file_obj1);
+            reinterpret_cast<CloseFileFn>(file_obj2->vtable[3])(file_obj2);
+            DeleteFileW(temp_file1);
+            DeleteFileW(temp_file2);
+            return false;
+        }
+        long hr0 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0);
+        long hr1 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 1);
+        long hr2 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 2);
+        reinterpret_cast<CloseFileFn>(file_obj1->vtable[3])(file_obj1);
+        reinterpret_cast<CloseFileFn>(file_obj2->vtable[3])(file_obj2);
+        DeleteFileW(temp_file1);
+        DeleteFileW(temp_file2);
+
+        if (hr0 != 0 || hr1 != 0 || hr2 != 0) return false;
+        for (unsigned char b : dest1_0) if (b != 0x41) return false;
+        for (unsigned char b : dest2) if (b != 0x42) return false;
+        for (unsigned char b : dest1_1) if (b != 0x41) return false;
+    }
+
     // Control: standalone stream with damaged checksum at matching offset fails and leaves destination unchanged (Refs #1214)
     {
         const size_t stream_plain_size = 128 * 1024;
