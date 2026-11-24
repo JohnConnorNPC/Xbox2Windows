@@ -35,6 +35,21 @@ DWORD WINAPI output_window_thread(void* ready)
             ShowWindow(window, SW_MINIMIZE);
             return 0;
         }
+        if (message == WM_TIMER) {
+            // Local (X2W_OUTPUT_TOPMOST=1): the title's own blank window covers this one under Wine;
+            // it is minimised, which the title tolerates, and this window keeps the keyboard.
+            EnumWindows([](HWND candidate, LPARAM) -> BOOL {
+                DWORD process = 0;
+                wchar_t name[64];
+                GetWindowThreadProcessId(candidate, &process);
+                if (process == GetCurrentProcessId() && IsWindowVisible(candidate) && !IsIconic(candidate) &&
+                    !GetWindow(candidate, GW_OWNER) && GetClassNameW(candidate, name, 64) &&
+                    lstrcmpW(name, x2w_startup::presenter_class) != 0 && lstrcmpW(name, L"ConsoleWindowClass") != 0)
+                    ShowWindow(candidate, SW_SHOWMINNOACTIVE);
+                return TRUE;
+            }, 0);
+            return 0;
+        }
         return DefWindowProcW(window, message, w, l);
     };
     cls.hInstance = GetModuleHandleW(nullptr);
@@ -46,6 +61,12 @@ DWORD WINAPI output_window_thread(void* ready)
     output_handle = CreateWindowExW(0, cls.lpszClassName, L"Xbox2Windows - output", WS_OVERLAPPEDWINDOW, 60, 60,
                                     area.right - area.left, area.bottom - area.top, nullptr, nullptr, cls.hInstance, nullptr);
     if (output_handle) ShowWindow(output_handle, SW_SHOWNOACTIVATE);
+    // Local: under Wine the title's own (blank) window ends up above this one; X2W_OUTPUT_TOPMOST=1 keeps the output on top.
+    if (output_handle && x2w_local::env_on("X2W_OUTPUT_TOPMOST"))
+    {
+        SetWindowPos(output_handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetTimer(output_handle, 1, 500, nullptr);
+    }
     SetEvent(static_cast<HANDLE>(ready));
     MSG message;
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
