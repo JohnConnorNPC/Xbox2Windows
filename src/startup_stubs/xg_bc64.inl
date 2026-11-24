@@ -112,5 +112,6 @@ long __stdcall bc64_tiling(Computer* self, UINT* tiles, D3D12_PACKED_MIP_INFO* p
         }
         *count = written;
     }
+    trace_tiling("bc64", desc, tiles, packed, shape, count, first, tilings);
     return S_OK;
 }

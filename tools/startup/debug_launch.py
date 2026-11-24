@@ -8,6 +8,7 @@ Stops at the first second-chance exception, at a breakpoint inside the main imag
 """
 import ctypes
 import ctypes.wintypes as wt
+import json
 import os
 import struct
 import sys
@@ -270,6 +271,8 @@ def main():
                 hooks[addr] = (name, "valloc")
     bink_counts, bink_state = {}, {}
     hit_counts = {}
+    probe = {"hits": 0, "tables": {}, "counts": {}, "log": None}
+    host_cpu_done = set()
     redirects = {}
     # Offline by default (--offline 0 turns it off): no sockets, NetBIOS name devices or DNS resolver.
     offline = opts.get("--offline", "1") == "1"
@@ -369,6 +372,60 @@ def main():
                                    f"type={kind & 0xffffffff:#x} protect={protect & 0xffffffff:#x} callers: {' '.join(chain[:10])}\n")
                     file_log.flush()
                 desc = None
+            elif arg == "reader":
+                # Local diagnostic (X2W_READER_PROBE=<rva of the pack reader's request call>): at each
+                # request the reader issues, compare the position with the chosen chunk-table entry.
+                # Every distinct in-memory table is written once; requests whose position lies outside
+                # the entry's span are recorded with the neighbouring entries, registers and stack.
+                desc = None
+                stream, entry_at, remaining = regs["R15"], regs["Rdi"], regs["R14"]
+                frame = read(rsp, 0x80) or bytes(0x80)
+                position = struct.unpack_from("<Q", frame, 0x20)[0]
+                head = read(stream, 0x40) or bytes(0x40)
+                table, count = struct.unpack_from("<Q", head, 0x20)[0], struct.unpack_from("<I", head, 0x28)[0]
+                pair = read(entry_at, 16)
+                probe["hits"] += 1
+                if pair and table and 2 <= count < 4_000_000:
+                    low, high = struct.unpack("<QQ", pair)
+                    first = ((low >> 30) & 0x3FFFFF) << 12
+                    span = (((high >> 30) - (low >> 30)) & 0xFFFFF) << 12
+                    codec = (low >> 26) & 15
+                    delta = position - first
+                    key = (stream, table, count)
+                    if key not in probe["tables"]:
+                        blob = read(table, count * 8)
+                        probe["tables"][key] = len(probe["tables"])
+                        if blob:
+                            with open(os.path.join(logdir, f"reader_table_{probe['tables'][key]:03d}.bin"), "wb") as handle:
+                                handle.write(blob)
+                        probe["log"].write(json.dumps({"t": round(time.time() - start, 3), "kind": "table", "n": probe["tables"][key],
+                                                       "stream": stream, "table": table, "count": count, "head": head.hex()}) + "\n")
+                    kind = "start" if delta == 0 else "inside" if 0 < delta < span else "outside"
+                    if not codec:
+                        kind = "raw"
+                    counts = probe["counts"].setdefault(probe["tables"][key], {})
+                    counts[kind] = counts.get(kind, 0) + 1
+                    limit = {"outside": 120, "inside": 40}.get(kind, 4)
+                    if counts[kind] <= limit:
+                        index = (entry_at - table) // 8
+                        lo = max(0, index - 8)
+                        near = read(table + lo * 8, 8 * 17) or b""
+                        row = {"t": round(time.time() - start, 3), "kind": kind, "n": probe["tables"][key], "index": index,
+                               "position": position, "remaining": remaining, "first": first, "span": span, "codec": codec,
+                               "delta": delta, "request": frame[0x30:0x78].hex(), "near_from": lo, "near": near.hex()}
+                        if kind == "outside":
+                            row["regs"] = {k: v for k, v in regs.items()}
+                            row["stack"] = (read(rsp, 0x800) or b"").hex()
+                            if counts[kind] == 1:
+                                blob = read(table, count * 8)
+                                if blob:
+                                    with open(os.path.join(logdir, f"reader_table_{probe['tables'][key]:03d}_at_outside.bin"), "wb") as handle:
+                                        handle.write(blob)
+                        probe["log"].write(json.dumps(row) + "\n")
+                    if probe["hits"] % 2000 == 0:
+                        probe["log"].write(json.dumps({"t": round(time.time() - start, 3), "kind": "counts", "hits": probe["hits"],
+                                                       "counts": probe["counts"]}) + "\n")
+                    probe["log"].flush()
             elif arg == "count":
                 # Title function hit counter: first hits are logged with registers and the caller.
                 hit_counts[name] = hit_counts.get(name, 0) + 1
@@ -515,6 +572,9 @@ def main():
             main_base = base
             for item in filter(None, os.environ.get("X2W_COUNT", "").split(",")):
                 hooks[base + int(item, 16)] = (f"+{item}", "count")
+            if os.environ.get("X2W_READER_PROBE"):
+                hooks[base + int(os.environ["X2W_READER_PROBE"], 16)] = ("reader", "reader")
+                probe["log"] = open(os.path.join(logdir, "reader_probe.jsonl"), "w", encoding="utf-8")
             # Experiment switch X2W_REDIRECT=<rva>@<n>:<target rva>[,...]: on the n-th hit of a title
             # address, execution continues at another address instead. Used to force one code path.
             for item in filter(None, os.environ.get("X2W_REDIRECT", "").split(",")):
@@ -586,9 +646,13 @@ def main():
                 continue
             if (ex_code == 0xC000001D and first and host_cpu_on and not stop_first and main_base
                     and main_base <= ex_addr < main_base + 0x10000000):
-                name = rewrite_for_host(ex_addr)
+                # A second thread can fault on an instruction that was rewritten while its exception
+                # was pending; the rewritten bytes just need to run.
+                name = "already rewritten" if ex_addr in host_cpu_done else rewrite_for_host(ex_addr)
                 if not name and sha_for_host(tid, ex_addr):
                     name = "sha (per hit)"
+                if name and name not in ("sha (per hit)", "already rewritten"):
+                    host_cpu_done.add(ex_addr)
                 if name:
                     host_cpu_sites[name] = host_cpu_sites.get(name, 0) + 1
                     if sum(host_cpu_sites.values()) <= 40:
@@ -622,6 +686,22 @@ def main():
         ex_code, ex_addr, tid, first, params = stop
         print(f"stopped at {NAMES.get(ex_code, hex(ex_code))} ({ex_code:#010x}) at {where(ex_addr)} after {elapsed:.2f} s "
               f"({'first' if first else 'second'} chance) params={[hex(p) for p in params]}")
+        if ex_code == 0xC0000005 and len(params) > 1:
+            # Local diagnostic: the memory regions around the faulting address.
+            class MBI(ctypes.Structure):
+                _fields_ = [("base", ctypes.c_uint64), ("alloc_base", ctypes.c_uint64), ("alloc_protect", wt.DWORD), ("part", wt.WORD),
+                            ("size", ctypes.c_uint64), ("state", wt.DWORD), ("protect", wt.DWORD), ("type", wt.DWORD)]
+            info = MBI()
+            k32.VirtualQueryEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+            cursor = max(0, (params[1] & ~0xFFFF) - 0x4000000)
+            for _ in range(40):
+                if not k32.VirtualQueryEx(wt.HANDLE(pi.hProcess), ctypes.c_void_p(cursor), ctypes.byref(info), ctypes.sizeof(info)):
+                    break
+                print(f"  region {info.base:#x}+{info.size:#x} alloc_base={info.alloc_base:#x} state={info.state:#x} protect={info.protect:#x} "
+                      f"type={info.type:#x}{'  <-- fault' if info.base <= params[1] < info.base + info.size else ''}")
+                cursor = info.base + info.size
+                if cursor > params[1] + 0x4000000:
+                    break
         thread = k32.OpenThread(0x0008 | 0x0002 | 0x0040, False, tid)  # GET_CONTEXT | SUSPEND | QUERY
         raw = (ctypes.c_ubyte * (1232 + 16))()
         ctx_addr = (ctypes.addressof(raw) + 15) & ~15

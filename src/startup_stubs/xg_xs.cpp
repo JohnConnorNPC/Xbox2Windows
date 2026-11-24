@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include "startup_stubs/bc64_chain.h"
+#include "startup_stubs/tile64_plan.h"
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -96,6 +97,34 @@ void notify_texture_write(void* base, u64 bytes)
     if (notify) notify(base, bytes);
 }
 
+// Local diagnostic: every distinct slot-10 query with its full answer.
+void trace_tiling(const char* path, const D3D12_RESOURCE_DESC& d, const UINT* tiles, const D3D12_PACKED_MIP_INFO* packed,
+                  const D3D12_TILE_SHAPE* shape, const UINT* count, UINT first, const D3D12_SUBRESOURCE_TILING* tilings)
+{
+    struct Key { u64 w; UINT h, depth, mips, format, layout, flags, first; };
+    static Key seen[1024];
+    static unsigned used;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    const Key key{d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, static_cast<UINT>(d.Format), static_cast<UINT>(d.Layout),
+                  static_cast<UINT>(d.Flags), first};
+    AcquireSRWLockExclusive(&lock);
+    bool known = used >= 1024;
+    for (unsigned i = 0; i < used && !known; ++i) known = !std::memcmp(&seen[i], &key, sizeof(key));
+    if (!known) seen[used++] = key;
+    ReleaseSRWLockExclusive(&lock);
+    if (known) return;
+    char text[700];
+    int n = std::snprintf(text, sizeof(text), "x2w-xg tiling-trace %s dim=%d %llux%ux%u mips=%u fmt=%d layout=0x%x flags=0x%x align=0x%llx first=%u "
+                          "-> tiles=%u standard=%u packed=%u packed_tiles=%u packed_start=%u shape=%ux%ux%u count=%u:", path, d.Dimension, d.Width,
+                          d.Height, d.DepthOrArraySize, d.MipLevels, d.Format, static_cast<UINT>(d.Layout), static_cast<UINT>(d.Flags),
+                          d.Alignment, first, tiles ? *tiles : 0, packed ? packed->NumStandardMips : 0, packed ? packed->NumPackedMips : 0,
+                          packed ? packed->NumTilesForPackedMips : 0, packed ? packed->StartTileIndexInOverallResource : 0,
+                          shape ? shape->WidthInTexels : 0, shape ? shape->HeightInTexels : 0, shape ? shape->DepthInTexels : 0, count ? *count : 0);
+    for (UINT i = 0; tilings && count && i < *count && i < 16 && n < 640; ++i)
+        n += std::snprintf(text + n, sizeof(text) - n, " %ux%u@%u", tilings[i].WidthInTiles, tilings[i].HeightInTiles,
+                           tilings[i].StartTileIndexInOverallResource);
+    x2w_local::logf("%s", text);
+}
 #include "startup_stubs/xg_bc64.inl"
 
 void write_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc, unsigned char* layout)
@@ -230,6 +259,27 @@ void __stdcall computer_tiling(Computer* self, UINT* tiles, D3D12_PACKED_MIP_INF
     if (shape) *shape = {};
     const UINT capacity = count ? *count : 0;
     if (count) *count = 0;
+    if (x2w_startup::tile64::Plan::supports(self->desc)) {
+        // A 64 KiB standard layout: the shared tile comes first in each slice, then the mips from
+        // the smallest to the largest. Entries keep their position in the requested range; the
+        // returned count covers the standard mips only.
+        const x2w_startup::tile64::Plan plan(self->desc);
+        if (tiles) *tiles = plan.slice_tiles * plan.slices;
+        if (packed) *packed = {static_cast<UINT8>(plan.standard), static_cast<UINT8>(plan.mips - plan.standard), plan.shared_tiles, 0};
+        if (shape) *shape = {plan.tile_width, plan.tile_height, 1};
+        const UINT subresources = plan.mips * plan.slices;
+        const UINT available = first < subresources ? subresources - first : 0;
+        UINT written = 0;
+        for (UINT i = 0; i < (std::min)(capacity, available); ++i) {
+            const UINT mip = (first + i) % plan.mips, slice = (first + i) / plan.mips;
+            if (mip >= plan.standard) continue;
+            if (tilings) tilings[i] = {plan.wide[mip], static_cast<UINT16>(plan.high[mip]), 1, slice * plan.slice_tiles + plan.start[mip]};
+            ++written;
+        }
+        if (count) *count = written;
+        trace_tiling("tile64", self->desc, tiles, packed, shape, count, first, tilings);
+        return;
+    }
     ID3D12Device* device = layout_device();
     HRESULT hr = E_FAIL;
     if (device) {
@@ -244,6 +294,7 @@ void __stdcall computer_tiling(Computer* self, UINT* tiles, D3D12_PACKED_MIP_INF
             reserved->Release();
         }
     }
+    trace_tiling("desktop", self->desc, tiles, packed, shape, count, first, tilings);
     static LONG calls, failures;
     if (x2w_local::first_calls(calls, 6) || (FAILED(hr) && x2w_local::first_calls(failures, 8)))
         x2w_local::logf("x2w-xg TextureComputer::slot10(tiling) dim=%d %llux%ux%u mips=%u fmt=%d flags=0x%x -> 0x%08lx tiles=%u "

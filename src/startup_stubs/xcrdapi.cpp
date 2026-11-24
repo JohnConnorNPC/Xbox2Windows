@@ -68,7 +68,19 @@ struct Entry {
     u64 value;
     u64 id = 0;
     u64 submission_id = 0;
+    void* callers[6] = {};  // local diagnostic: return addresses at enqueue
 };
+// Local diagnostic (X2W_DSTORAGE_TRACE=<file>): one line per executed request.
+thread_local void* const* trace_callers;
+thread_local unsigned trace_tokens;
+FILE* trace_file()
+{
+    static FILE* file = [] {
+        char path[MAX_PATH];
+        return GetEnvironmentVariableA("X2W_DSTORAGE_TRACE", path, sizeof(path)) ? std::fopen(path, "w") : nullptr;
+    }();
+    return file;
+}
 struct CachedStream {
     u64 source = 0;
     u64 base_offset = 0;
@@ -335,6 +347,25 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // synchronously; compressed ones are logged and left undone. The first requests are logged in full.
 LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
 LONG zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue;
+LONG entries_pushed, entries_submitted, entries_run;  // local diagnostic
+// Local diagnostic: failed requests counted by their outcome string.
+struct FailureKind { const char* text; LONG count; };
+FailureKind failure_kinds[24];
+SRWLOCK failure_lock = SRWLOCK_INIT;
+LONG count_failure(const char* outcome)
+{
+    AcquireSRWLockExclusive(&failure_lock);
+    LONG result = 0;
+    for (auto& kind : failure_kinds) {
+        if (!kind.text) kind.text = outcome;
+        if (kind.text == outcome || !std::strcmp(kind.text, outcome)) {
+            result = ++kind.count;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&failure_lock);
+    return result;
+}
 // Try to serve an identified continuation slice of an already-inflated chunked stream from the in-memory cache
 // (Refs #1136, #1144, #1198, #1214). Returns true if this request was matched as a continuation slice.
 static bool try_serve_cached_continuation(Object* self, u64 source, u64 offset, unsigned source_size,
@@ -556,6 +587,13 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         // Track decode length and destination capacity as separate values (Refs #1144).
         // A short destination or missing/insufficient page grant must fail the request
         // and leave the destination memory completely unchanged.
+        // Local experiment (X2W_DSTORAGE_PREFIX=1): a zlib stream longer than the destination delivers
+        // its first destination-size bytes instead of failing the request.
+        static const bool prefix_mode = GetEnvironmentVariableA("X2W_DSTORAGE_PREFIX", nullptr, 0) != 0;
+        if (prefix_mode && zlib && !bcpack && decode_length > destination_capacity) {
+            decode_length = destination_capacity;
+            outcome = "inflated (prefix)";
+        }
         if (decode_length > destination_capacity) {
             outcome = "destination capacity exceeded";
             data = nullptr;
@@ -608,6 +646,24 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     }
     const bool failed = (data == nullptr || !written) && std::strcmp(outcome, "empty") != 0;
     if (failed) InterlockedIncrement(&requests_failed);
+    if (FILE* trace = trace_file()) {
+        static SRWLOCK trace_lock = SRWLOCK_INIT;
+        static const ULONGLONG zero = GetTickCount64();
+        AcquireSRWLockExclusive(&trace_lock);
+        std::fprintf(trace, "%.3f id=%llu sub=%llu opt=%llx dsz=%x poff=%x tok=%u src=%llx off=%llx ssz=%x w34=%x w38=%x out=%zx %s |%s| c=%p,%p,%p,%p,%p\n",
+                     (GetTickCount64() - zero) / 1000.0, entry_id, submission_id, options, destination_size, page_offset, trace_tokens, source, offset,
+                     source_size, *reinterpret_cast<const unsigned*>(request + 0x34), *reinterpret_cast<const unsigned*>(request + 0x38),
+                     decode_length, failed ? "FAIL" : "ok", outcome, trace_callers ? trace_callers[0] : nullptr, trace_callers ? trace_callers[1] : nullptr,
+                     trace_callers ? trace_callers[2] : nullptr, trace_callers ? trace_callers[3] : nullptr, trace_callers ? trace_callers[4] : nullptr);
+        ReleaseSRWLockExclusive(&trace_lock);
+    }
+    // Local diagnostic: failures by outcome, and the first requests of each kind with their options.
+    if (failed) {
+        const LONG nth = count_failure(outcome);
+        if (nth <= 6)
+            log("x2w-dstorage   failure #%ld of \"%s\": options=0x%llx bcpack=%u dest_size=0x%x capacity=0x%x source=0x%llx offset=0x%llx size=0x%x",
+                nth, outcome, options, bcpack, destination_size, static_cast<unsigned>(destination_capacity), source, offset, source_size);
+    }
     if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG summaries, failures;
     if (InterlockedIncrement(&summaries) <= 12 || (failed && InterlockedIncrement(&failures) <= 12))
@@ -619,6 +675,7 @@ void signal_fence(void* fence, u64 value);
 
 void run_entry(Object* self, Entry& entry)
 {
+    InterlockedIncrement(&entries_run);
     if (entry.type == Entry::request) {
         const u64 options = *reinterpret_cast<const u64*>(entry.bytes);
         if ((options & (1ull << 21)) && !entry.tokens.empty()) {
@@ -645,6 +702,8 @@ void run_entry(Object* self, Entry& entry)
             }
             entry.tokens = std::move(now);
         }
+        trace_callers = entry.callers;
+        trace_tokens = static_cast<unsigned>(entry.tokens.size());
         execute_request(self, entry.bytes, entry.tokens.empty() ? nullptr : entry.tokens.data(), entry.id, entry.submission_id);
     } else if (entry.type == Entry::status_entry) {
         const LONG result = InterlockedExchange(&self->pending, S_OK);
@@ -700,6 +759,7 @@ void submit(Object* self)
     {
         const std::lock_guard guard(work.mutex);
         const u64 submission_id = ++work.next_submission_id;
+        InterlockedExchangeAdd(&entries_submitted, static_cast<LONG>(work.waiting.size()));
         for (auto& entry : work.waiting) {
             entry.submission_id = submission_id;
             work.submitted.push_back(std::move(entry));
@@ -711,6 +771,7 @@ void submit(Object* self)
 
 void push(Object* self, Entry&& entry)
 {
+    InterlockedIncrement(&entries_pushed);
     QueueWork& work = work_of(self);
     bool full;
     {
@@ -728,6 +789,7 @@ void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
     if (!request) return;
     Entry entry{};
     entry.type = Entry::request;
+    if (trace_file()) RtlCaptureStackBackTrace(1, 6, entry.callers, nullptr);
     std::memcpy(entry.bytes, request, sizeof entry.bytes);
     const u64 options = *reinterpret_cast<const u64*>(request);
     if (options & (1ull << 21)) {
@@ -928,6 +990,17 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                     "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
                     requests_failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
                     section_text);
+                {
+                    char kinds[600] = "";
+                    int used = 0;
+                    AcquireSRWLockShared(&failure_lock);
+                    for (const auto& kind : failure_kinds)
+                        if (kind.text && used < 520) used += std::snprintf(kinds + used, sizeof(kinds) - used, " [%s]=%ld", kind.text, kind.count);
+                    ReleaseSRWLockShared(&failure_lock);
+                    log("x2w-dstorage queue %d s: entries pushed=%ld submitted=%ld run=%ld (not submitted %ld, submitted not run %ld)", second,
+                        entries_pushed, entries_submitted, entries_run, entries_pushed - entries_submitted, entries_submitted - entries_run);
+                    if (used) log("x2w-dstorage failures %d s:%s", second, kinds);
+                }
                 last = total2;
                 last_memory = sample;
             }
