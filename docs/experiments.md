@@ -10335,6 +10335,19 @@ ctest --preset release --no-tests=error -R '^cpu_native_acphal_hal$' -V
 
 The desktop `AcpHal.dll` stand-in (not the fixture provider above) now returns `ApuAlloc` blocks on `ApuFree` through a first-fit free list with coalescing, so repeated allocate and free cycles no longer exhaust the heap. It is a stand-in contract only: the console's error codes, alignment limits and zero-size behaviour are not public, and the codes chosen are listed in [startup-runtime.md](startup-runtime.md#apu-heap-stand-in). The source-built check is `ctest --preset dev --no-tests=error -R '^startup_acphal_apu_free$' -V`.
 
+### XMA context activity in the AcpHal stand-in
+
+With `X2W_AUDIO_PERMISSIVE=1` and `X2W_AUDIO_ACTIVITY=1`, the desktop `AcpHal.dll` and `xapu.dll` stand-ins count what a caller does with the audio processor. This is a first measurement for [issue #1145](https://github.com/R0Y00/Xbox2Windows/issues/1145), before any decoding. AcpHal compares the XMA context array it allocated with a copy about every 10 ms and counts contexts filled (all zero to nonzero), changed and cleared, plus HAL slot2 submits by type. xapu counts `XApuEnqueueCommand` calls by command class with no cap. Each DLL logs a line per second when a count moved; the experimental exports `x2w_acphal_xma_activity` and `x2w_xapu_command_counts` return the totals. Line formats and limits are in [startup-runtime.md](startup-runtime.md#activity-counter).
+
+`startup_acphal_xma_activity` runs one source-built caller script in three child processes. With the counter on, the caller fills 5 contexts, changes 3 and clears 2, submits 4 HAL commands of types 1, 1, 3 and 12, and enqueues 6 XApu commands of classes 1, 2 and 0x20, one null command and one command on an unknown handle. The exports and the summed log lines must give exactly those counts, and an array freed and allocated again must not be counted. The zero-write control writes only the 64 bytes after the last context and sends nothing: every count must be 0 and no line may be logged. With the counter off, the exports report nothing and no line is logged. Every result, output, last error and the final context bytes must match between the on and off runs.
+
+```powershell
+cmake --build --preset release --target startup_acphal_xma_activity
+ctest --preset release --no-tests=error -R '^startup_acphal_xma_activity$' -V
+```
+
+The 64-byte context stride and the command class (the first `UINT32` of a command) are stand-in conventions, not console contracts. The counter identifies no field inside a context, such as an enable flag, decodes nothing, and does not establish which counted event starts playback.
+
 ### XApu command-queue caller and recorder
 
 A source-built caller ([`xapu_queue_caller.asm`](../tests/cpu/xapu_queue_caller.asm)) imports the five `xapu.dll` command-queue functions by name (`XApuConnect`, `XApuEnqueueCommand`, `XApuGetResultCount`, `XApuDequeueResult`, `XApuDisconnect`), plus `finish_exe` from `cpu_exe_io.dll`, and starts through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). A test-only recording provider ([`xapu_queue_provider.cpp`](../tests/cpu/xapu_queue_provider.cpp)) serves the five names. This is not a production `xapu.dll`, and this change adds no binding.
