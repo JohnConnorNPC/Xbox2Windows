@@ -111,8 +111,10 @@ Snapshot take(ActivityFn fn)
     return s;
 }
 
+using Fields = std::initializer_list<std::pair<int, u64>>;  // (field, value) pairs
+
 // Every field is zero except the listed ones.
-void expect(const char* label, const Snapshot& s, BOOL on, int fields, std::initializer_list<std::pair<int, u64>> nonzero)
+void expect(const char* label, const Snapshot& s, BOOL on, int fields, Fields nonzero)
 {
     bool good = s.on == on;
     for (int i = 0; i < fields; ++i) {
@@ -126,6 +128,12 @@ void expect(const char* label, const Snapshot& s, BOOL on, int fields, std::init
     for (int i = 0; i < fields; ++i) std::printf(" %llu", s.v[i]);
     std::printf("\n");
     ++failures;
+}
+
+// The fields expected with the counter on; with it off the export returns FALSE and every field must be zero.
+void expect_on(const char* label, const Snapshot& s, bool on, int fields, Fields when_on)
+{
+    expect(label, s, on, fields, on ? when_on : Fields{});
 }
 
 std::string read_file(const char* path)
@@ -207,7 +215,7 @@ void script(const Api& api, bool on)
     note("AcpHalAllocateShapeContexts", api.shape_alloc(&ctx), ctx.apu[4]);
     unsigned char* const base = ctx.arrays[4];
     if (!base) return check(false, "XMA contexts allocated");
-    expect("before any write", take(api.acphal_activity), on, acphal_fields, {{watched, on ? contexts : 0}});
+    expect_on("before any write", take(api.acphal_activity), on, acphal_fields, {{watched, contexts}});
 
     // Fill 5 contexts, one word each; context 349 uses its last word.
     store(base, 0, 0, 0x1111);
@@ -215,22 +223,19 @@ void script(const Api& api, bool on)
     store(base, 2, 0, 0x3333);
     store(base, 100, 5, 0x4444);
     store(base, 349, 7, 0x5555);
-    expect("after 5 fills", take(api.acphal_activity), on, acphal_fields,
-           on ? std::initializer_list<std::pair<int, u64>>{{watched, contexts}, {live, 5}, {filled, 5}}
-              : std::initializer_list<std::pair<int, u64>>{});
+    expect_on("after 5 fills", take(api.acphal_activity), on, acphal_fields,
+              {{watched, contexts}, {live, 5}, {filled, 5}});
     // Change 3 live contexts: the same word, the last word, another word.
     store(base, 0, 0, 0x1112);
     store(base, 1, 7, 0x2223);
     store(base, 100, 2, 0x4445);
-    expect("after 3 changes", take(api.acphal_activity), on, acphal_fields,
-           on ? std::initializer_list<std::pair<int, u64>>{{watched, contexts}, {live, 5}, {filled, 5}, {changed, 3}}
-              : std::initializer_list<std::pair<int, u64>>{});
+    expect_on("after 3 changes", take(api.acphal_activity), on, acphal_fields,
+              {{watched, contexts}, {live, 5}, {filled, 5}, {changed, 3}});
     // Clear 2 contexts.
     store(base, 2, 0, 0);
     store(base, 349, 7, 0);
-    expect("after 2 clears", take(api.acphal_activity), on, acphal_fields,
-           on ? std::initializer_list<std::pair<int, u64>>{{watched, contexts}, {live, 3}, {filled, 5}, {changed, 3}, {cleared, 2}}
-              : std::initializer_list<std::pair<int, u64>>{});
+    expect_on("after 2 clears", take(api.acphal_activity), on, acphal_fields,
+              {{watched, contexts}, {live, 3}, {filled, 5}, {changed, 3}, {cleared, 2}});
 
     const unsigned input = 0x12345678u;
     for (unsigned type : {1u, 1u, 3u, 12u}) {
@@ -238,10 +243,9 @@ void script(const Api& api, bool on)
         note("AcpHal submit", hal_submit(hal, type, 0x1234, 2, &input, 0), type);
     }
     const auto after_submits = take(api.acphal_activity);
-    expect("after 4 HAL submits", after_submits, on, acphal_fields,
-           on ? std::initializer_list<std::pair<int, u64>>{{watched, contexts}, {live, 3}, {filled, 5}, {changed, 3}, {cleared, 2},
-                                                           {submits, 4}, {submit_type0 + 1, 2}, {submit_type0 + 3, 1}, {submit_other, 1}}
-              : std::initializer_list<std::pair<int, u64>>{});
+    expect_on("after 4 HAL submits", after_submits, on, acphal_fields,
+              {{watched, contexts}, {live, 3}, {filled, 5}, {changed, 3}, {cleared, 2}, {submits, 4}, {submit_type0 + 1, 2},
+               {submit_type0 + 3, 1}, {submit_other, 1}});
 
     unsigned char connect_input[0x18]{}, connect_output[0x10]{};
     u64 handle = 0;
@@ -273,9 +277,8 @@ void script(const Api& api, bool on)
     }
     sentinel();
     note("XApuDisconnect", api.disconnect(handle));
-    expect("XApu commands", take(api.xapu_counts), on, xapu_fields,
-           on ? std::initializer_list<std::pair<int, u64>>{{1, 3}, {2, 2}, {class_other, 1}, {unreadable, 1}, {rejected, 1}}
-              : std::initializer_list<std::pair<int, u64>>{});
+    expect_on("XApu commands", take(api.xapu_counts), on, xapu_fields,
+              {{1, 3}, {2, 2}, {class_other, 1}, {unreadable, 1}, {rejected, 1}});
 
     unsigned hash = 2166136261u;  // FNV-1a of the context bytes: the counter never writes caller memory
     for (std::uint32_t i = 0; i < contexts * 64; ++i) hash = (hash ^ base[i]) * 16777619u;
@@ -291,6 +294,7 @@ void script(const Api& api, bool on)
     note("ApuAlloc same size", api.alloc(&again, &again_apu, contexts * 64, 64, 0), again_apu);
     sentinel();
     note("same block", 0, again == base);
+    check(again == base, "ApuAlloc of the same size returns the freed context block");
     if (again) {
         auto* p = static_cast<unsigned char*>(again);
         store(p, 0, 0, 0x6666);
@@ -298,10 +302,9 @@ void script(const Api& api, bool on)
         store(p, 300, 7, 0x8888);
         Sleep(50);  // several sampler periods
     }
-    expect("after free and reuse", take(api.acphal_activity), on, acphal_fields,
-           on ? std::initializer_list<std::pair<int, u64>>{{filled, 5}, {changed, 3}, {cleared, 2}, {submits, 4},
-                                                           {submit_type0 + 1, 2}, {submit_type0 + 3, 1}, {submit_other, 1}}
-              : std::initializer_list<std::pair<int, u64>>{});
+    expect_on("after free and reuse", take(api.acphal_activity), on, acphal_fields,
+              {{filled, 5}, {changed, 3}, {cleared, 2}, {submits, 4}, {submit_type0 + 1, 2}, {submit_type0 + 3, 1},
+               {submit_other, 1}});
 }
 
 // Zero-write control: the counter is on, the caller writes only to the block after the contexts and sends nothing.
@@ -414,7 +417,8 @@ DWORD spawn(const char* self, const char* name, const char* acphal, const char* 
     PROCESS_INFORMATION pi{};
     if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) return 0xFFFFFFFFu;
     DWORD code = 0xFFFFFFFEu;
-    if (WaitForSingleObject(pi.hProcess, 30000) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+    // 15 s per case keeps all three inside the CTest TIMEOUT of 60 s, so a hung case is named, not killed with the parent.
+    if (WaitForSingleObject(pi.hProcess, 15000) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
     else TerminateProcess(pi.hProcess, 0xFFFFFFFDu);  // our own child, by handle
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
