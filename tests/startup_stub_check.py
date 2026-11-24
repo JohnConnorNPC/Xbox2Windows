@@ -98,6 +98,14 @@ print(f"dstorage control: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
 if not ok:
     failures.append(f"dstorage control: exit {run.returncode}, stderr {run.stderr.strip()!r}")
 
+# Page arrays changed between EnqueueRequest and Submit: a replaced entry, and an unreadable array.
+run = subprocess.run([consumer, "dstorage-pages"], capture_output=True, text=True, env=env, timeout=20)
+print(run.stdout.strip())
+ok = run.returncode == 0 and "dstorage-pages ok" in run.stdout and "x2w-trap" not in run.stderr
+print(f"dstorage page-array control: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
+if not ok:
+    failures.append(f"dstorage page-array control: exit {run.returncode}, stdout {run.stdout.strip()!r}")
+
 if failures:
     print("FAIL")
     for f in failures:

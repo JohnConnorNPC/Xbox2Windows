@@ -304,8 +304,12 @@ These are measured on one executable; treat them as hypotheses for others.
   the second is a GPU view of the first. Mapping each page's section into both views makes those
   resources readable; without it, a YUV video shows a solid green screen (all-zero planes).
 - **DirectStorage ordering.** Requests must run after `Submit`, in order with status and fence
-  entries. Titles fill destination page-array entries after `EnqueueRequest`; an entry that is 0
-  at enqueue is read again when the request runs.
+  entries. Titles fill destination page-array entries after `EnqueueRequest`, and also replace
+  entries filled earlier, so the whole page array is read again when the request runs. The
+  heartbeat counts entries replaced after enqueue. The caller must keep the page array readable,
+  and stop changing it, once the request is submitted: the worker copies it once when the request
+  runs. If the array cannot be read then, the request fails before any destination page is
+  written; a token captured at enqueue is never used.
 - **Sub-dword addressing (SDWA).** The translator lowers the byte and word selects of the 32-bit
   integer VOP1/VOP2 SDWA forms: a source selection is zero-extended, or sign-extended under `sext()`,
   and the low bits of the result are placed in the destination field, with `UNUSED_PAD` zeroing the

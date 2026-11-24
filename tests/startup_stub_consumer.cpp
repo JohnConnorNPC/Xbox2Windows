@@ -6,6 +6,7 @@
 //   xg_xs    -> XGSuggestSwizzleMode(0x55, 0, 0, 0)
 //   physical -> XMemAllocatePhysicalPages/XMemFreePhysicalPages round trip (no trap expected)
 //   dstorage -> DirectStorage multi-page RFC 1950 zlib request, BCPack decode and failure controls (Refs #1139, #1144)
+//   dstorage-pages -> page-array entries replaced, or made unreadable, between EnqueueRequest and Submit
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -169,6 +170,137 @@ long __stdcall hold_worker(void* fence, u64) {
     if (WaitForSingleObject(gate.resume, 5000) != WAIT_OBJECT_0) return E_FAIL;
     InterlockedExchange(&gate.resumed, 1);
     return S_OK;
+}
+
+// Page-destination requests whose page array changes between EnqueueRequest and Submit:
+//   replaced:   a non-zero entry is replaced; the new page receives the data and the old page keeps
+//               its sentinel.
+//   unreadable: the array becomes unreadable; that request fails without writing any page, and a
+//               valid request queued after it on the same queue still completes.
+// Prints one line per case; returns false on the first mismatch.
+bool dstorage_page_array_checks() {
+    _putenv("X2W_XMEM_PERMISSIVE=1");
+    HMODULE xcrdapi = LoadLibraryA("XCRDAPI.dll");
+    if (!xcrdapi) return false;
+    auto get_factory = reinterpret_cast<DStorageGetFactoryFn>(GetProcAddress(xcrdapi, "DStorageGetFactory"));
+    void* factory_ptr = nullptr;
+    if (!get_factory || get_factory(nullptr, &factory_ptr) != 0 || !factory_ptr) return false;
+    auto* factory = static_cast<Object*>(factory_ptr);
+
+    const size_t page = 64 * 1024;
+    std::vector<unsigned char> plain(2 * page);
+    for (size_t i = 0; i < plain.size(); ++i) plain[i] = static_cast<unsigned char>((i % 251) ^ 0x5a);
+    const auto two_pages = make_stored_zlib(plain.data(), plain.size());
+    const auto one_page = make_stored_zlib(plain.data(), page);
+
+    size_t page_count = 3;
+    u64 pages[3] = {};
+    if (!XMemAllocatePhysicalPages(0x20400000ull, &page_count, pages) || page_count != 3) return false;
+    // Each physical page gets its own view, so every page can be checked after a request.
+    void* view[3] = {};
+    for (int i = 0; i < 3; ++i) {
+        const ULONG_PTR token = pages[i];
+        view[i] = XMemVirtualAlloc(nullptr, page, 0x20402000, 0x21, PAGE_READWRITE);
+        if (!view[i] || XMemMapPhysicalPages(view[i], 1, &token) != view[i]) return false;
+    }
+    auto fill = [&](unsigned char value) {
+        for (void* v : view) std::memset(v, value, page);
+    };
+    auto untouched = [&](int i, unsigned char value) {
+        const auto* bytes = static_cast<const unsigned char*>(view[i]);
+        for (size_t k = 0; k < page; ++k)
+            if (bytes[k] != value) return false;
+        return true;
+    };
+    auto request_for = [](unsigned char* request, const ULONG_PTR* tokens, unsigned size, const std::vector<unsigned char>& data,
+                          unsigned decoded) {
+        std::memset(request, 0, 0x48);
+        *reinterpret_cast<u64*>(request + 0x00) = 1 | (1ull << 21) | 0x400000;  // zlib, page destination, memory source
+        *reinterpret_cast<const ULONG_PTR**>(request + 0x08) = tokens;
+        *reinterpret_cast<unsigned*>(request + 0x18) = size;
+        *reinterpret_cast<const unsigned char**>(request + 0x20) = data.data();
+        *reinterpret_cast<unsigned*>(request + 0x30) = static_cast<unsigned>(data.size());
+        *reinterpret_cast<unsigned*>(request + 0x38) = decoded;
+    };
+    auto make_queue = [&](unsigned statuses, Object** queue, Object** status) {
+        void* status_ptr = nullptr;
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, statuses, "Status", nullptr, &status_ptr) != 0 ||
+            !status_ptr || reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr)
+            return false;
+        *queue = static_cast<Object*>(queue_ptr);
+        *status = static_cast<Object*>(status_ptr);
+        return true;
+    };
+    auto result_of = [](Object* status, unsigned index, long* hr) {
+        for (int i = 0; i < 200 && !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, index); ++i) Sleep(10);
+        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, index)) return false;
+        *hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, index);
+        return true;
+    };
+
+    // replaced: enqueue with {page 0, page 1}, then replace entry 1 with page 2 before Submit.
+    {
+        Object *queue = nullptr, *status = nullptr;
+        if (!make_queue(1, &queue, &status)) return false;
+        fill(0xAA);
+        ULONG_PTR tokens[2] = {pages[0], pages[1]};
+        unsigned char request[0x48];
+        request_for(request, tokens, static_cast<unsigned>(2 * page), two_pages, static_cast<unsigned>(2 * page));
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, request);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+        tokens[1] = pages[2];
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+        long hr = -1;
+        const bool done = result_of(status, 0, &hr);
+        const bool first = done && std::memcmp(view[0], plain.data(), page) == 0;
+        const bool moved = done && std::memcmp(view[2], plain.data() + page, page) == 0;
+        const bool old_kept = done && untouched(1, 0xAA);
+        std::printf("replaced: hr=0x%08lx first page %s, new page %s, old page %s\n", static_cast<unsigned long>(hr),
+                    first ? "ok" : "WRONG", moved ? "ok" : "WRONG", old_kept ? "kept" : "WRITTEN");
+        if (!done || hr != 0 || !first || !moved || !old_kept) return false;
+    }
+
+    // unreadable: the first request's array is made no-access before Submit; a valid one follows.
+    {
+        Object *queue = nullptr, *status = nullptr;
+        if (!make_queue(2, &queue, &status)) return false;
+        fill(0xAA);
+        auto* tokens = static_cast<ULONG_PTR*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!tokens) return false;
+        tokens[0] = pages[0];
+        tokens[1] = pages[1];
+        unsigned char bad[0x48];
+        request_for(bad, tokens, static_cast<unsigned>(2 * page), two_pages, static_cast<unsigned>(2 * page));
+        const ULONG_PTR good_tokens[1] = {pages[2]};
+        unsigned char good[0x48];
+        request_for(good, good_tokens, static_cast<unsigned>(page), one_page, static_cast<unsigned>(page));
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, bad);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, good);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
+        DWORD old_protection = 0;
+        if (!VirtualProtect(tokens, 4096, PAGE_NOACCESS, &old_protection)) return false;
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+        long bad_hr = 0, good_hr = -1;
+        const bool done = result_of(status, 0, &bad_hr) && result_of(status, 1, &good_hr);
+        const bool kept = done && untouched(0, 0xAA) && untouched(1, 0xAA);
+        const bool good_written = done && std::memcmp(view[2], plain.data(), page) == 0;
+        std::printf("unreadable: failed request hr=0x%08lx, pages %s; following request hr=0x%08lx, page %s\n",
+                    static_cast<unsigned long>(bad_hr), kept ? "kept" : "WRITTEN", static_cast<unsigned long>(good_hr),
+                    good_written ? "ok" : "WRONG");
+        VirtualFree(tokens, 0, MEM_RELEASE);
+        if (!done || bad_hr == 0 || !kept || good_hr != 0 || !good_written) return false;
+    }
+
+    for (void* v : view) {
+        XMemMapPhysicalPages(v, 1, nullptr);
+        VirtualFree(v, 0, MEM_RELEASE);
+    }
+    XMemFreePhysicalPages(3, pages);
+    return true;
 }
 
 bool dstorage_checks() {
@@ -1626,6 +1758,11 @@ int main(int argc, char** argv)
         return 0;
     }
     if (!std::strcmp(which, "dstorage-directory")) return dstorage_directory_batches() ? 0 : 8;
+    if (!std::strcmp(which, "dstorage-pages")) {
+        if (!dstorage_page_array_checks()) return 9;
+        std::puts("dstorage-pages ok");
+        return 0;
+    }
     if (!std::strcmp(which, "dstorage")) {
         if (!dstorage_checks()) return 7;
         std::puts("dstorage ok");

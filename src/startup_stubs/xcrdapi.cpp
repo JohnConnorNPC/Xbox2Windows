@@ -334,7 +334,7 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // or memory pointer), +0x28 source offset, +0x30 source size (u32). Uncompressed requests are executed
 // synchronously; compressed ones are logged and left undone. The first requests are logged in full.
 LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
-LONG zero_tokens_at_enqueue, zero_tokens_at_run;
+LONG zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue;
 // Try to serve an identified continuation slice of an already-inflated chunked stream from the in-memory cache
 // (Refs #1136, #1144, #1198, #1214). Returns true if this request was matched as a continuation slice.
 static bool try_serve_cached_continuation(Object* self, u64 source, u64 offset, unsigned source_size,
@@ -623,11 +623,27 @@ void run_entry(Object* self, Entry& entry)
         const u64 options = *reinterpret_cast<const u64*>(entry.bytes);
         if ((options & (1ull << 21)) && !entry.tokens.empty()) {
             const auto* title = *reinterpret_cast<const ULONG_PTR* const*>(entry.bytes + 0x08);
-            for (std::size_t i = 0; i < entry.tokens.size(); ++i)
-                if (!entry.tokens[i] && title && x2w_local::readable(title + i, sizeof(ULONG_PTR))) {
-                    entry.tokens[i] = title[i];
-                    if (!entry.tokens[i]) InterlockedIncrement(&zero_tokens_at_run);
-                }
+            // The title's page array is read again in full when the request runs: entries are filled,
+            // and also replaced, after enqueue. Writing through a token captured at enqueue put data
+            // into a page the title had already reassigned. The caller has to keep the array readable
+            // until the request runs; if it is not, the request fails before any page is written, so
+            // no token captured at enqueue is ever used.
+            const std::size_t bytes = entry.tokens.size() * sizeof(ULONG_PTR);
+            if (!title || !x2w_local::readable(title, bytes)) {
+                InterlockedIncrement(&requests_failed);
+                if (self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
+                static LONG unreadable;
+                if (InterlockedIncrement(&unreadable) <= 12)
+                    log("x2w-dstorage   options=0x%llx page array %p (%zu entries) unreadable when the request runs -> failed", options,
+                        static_cast<const void*>(title), entry.tokens.size());
+                return;
+            }
+            std::vector<ULONG_PTR> now(title, title + entry.tokens.size());  // one snapshot of the whole array
+            for (std::size_t i = 0; i < now.size(); ++i) {
+                if (entry.tokens[i] && now[i] != entry.tokens[i]) InterlockedIncrement(&tokens_replaced_after_enqueue);
+                if (!now[i]) InterlockedIncrement(&zero_tokens_at_run);
+            }
+            entry.tokens = std::move(now);
         }
         execute_request(self, entry.bytes, entry.tokens.empty() ? nullptr : entry.tokens.data(), entry.id, entry.submission_id);
     } else if (entry.type == Entry::status_entry) {
@@ -909,8 +925,8 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                 // Heartbeat preserves "inflated=%ld" format string for tools/startup/live_view.py;
                 // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
                 log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
-                    "still 0 at run=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
-                    requests_failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, memory,
+                    "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
+                    requests_failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
                     section_text);
                 last = total2;
                 last_memory = sample;
