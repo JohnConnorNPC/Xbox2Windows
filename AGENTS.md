@@ -192,6 +192,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cvt_alu_check.py
 ./out/pe-env/bin/python -B tests/startup_triage_run_check.py
 ./out/pe-env/bin/python -B tests/startup_run_ps1_check.py
+./out/pe-env/bin/python -B tests/startup_run_sh_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_bit_alu_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_shift64_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_vopc_sdwa_check.py

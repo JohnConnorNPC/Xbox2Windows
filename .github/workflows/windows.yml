@@ -229,6 +229,7 @@ jobs:
             tests/startup_gfx2hlsl_readfirstlane_recompute_check.py \
             tests/startup_triage_run_check.py \
             tests/startup_run_ps1_check.py \
+            tests/startup_run_sh_check.py \
             tests/startup_flat_param_check.py \
             tests/startup_build_rev_check.py \
             tests/startup_gfx2hlsl_bit_alu_check.py \
