@@ -43,6 +43,8 @@ DWORD WINAPI output_window_thread(void* ready)
             bool refused = false;
             const int changed = title_hider.step(window, InterlockedCompareExchange(&window_presents, 0, 0),
                                                  InterlockedCompareExchange(&last_frame_shown, 0, 0), &refused);
+            // These flags are shared by every output window, so each line is logged once per process,
+            // not once per window. That is fine while there is one output window.
             static bool told_refused, told_hidden, told_shown;
             if (refused && !told_refused) {
                 told_refused = true;  // keyboard input reaches the title only while this process is in front

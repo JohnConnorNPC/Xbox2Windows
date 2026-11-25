@@ -43,7 +43,9 @@ Set `WINEPREFIX` to a prepared prefix ([Startup debugger under Wine](non-windows
 and `X2W_WIN_PYTHON` to the host path of a Windows `python.exe`; `WINE` (or `PROTON`) picks the Wine
 binary. `--data`, `--log`, `--storage` and `--shader-cache` take a host path or a drive path such as `G:\`.
 A drive path is passed on as it is; run.sh creates the log and shader-cache folders through the prefix's drive links. A
-title that opens its package by drive letter needs that letter. With `--render --translate`, the shader watcher runs in
+title that opens its package by drive letter needs that letter. The title id and storage size come from the package's
+`MicrosoftGame.config`, the first tag of each in any case, as `run.ps1` reads them. Unlike `run.ps1`, a value must start
+on its tag's line, and a UTF-16 config is not read. With `--render --translate`, the shader watcher runs in
 its own process group with `d3dcompiler_47=n` added to its `WINEDLLOVERRIDES`, and the whole group is
 stopped when the run ends. `--hide-title-window` sets `X2W_HIDE_TITLE_WINDOW=1`
 ([Switches](startup-runtime.md#switches)).
