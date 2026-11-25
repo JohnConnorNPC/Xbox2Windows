@@ -395,6 +395,7 @@ extern "C" __declspec(noinline) long XApuEnqueueCommand(u64 rcx, u64 rdx, u64 r8
         static LONG bad_cmd_calls;
         if (x2w_local::first_calls(bad_cmd_calls, 2))
             x2w_local::logf("x2w-audio XApuEnqueueCommand handle=0x%llx -> E_POINTER", rcx);
+        count_command(hr_pointer, nullptr);  // a header this call refuses as unreadable counts as unreadable
         return hr_pointer;
     }
     QueueEntry entry{};
