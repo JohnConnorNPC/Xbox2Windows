@@ -229,6 +229,13 @@ windows, build `startup_overlay_window` and run
 `ctest --preset release --no-tests=error -R '^startup_overlay_window$' -V`.
 The same run raises each of two guests in turn and checks that the raised one is
 selected.
+With `X2W_HIDE_TITLE_WINDOW=1`, a 500 ms timer on the output window's thread hides the title's own
+visible, unowned windows once a present has reached the output window, and hides them again when the
+title shows them. Dialogs (class `#32770`) stay visible. When a hidden window was in front, the output
+window takes the foreground, because keyboard input reaches the title only while a window of its process
+is in front. Without the variable no timer is created. `startup_overlay_window` also checks that the
+switch is off when unset or `0`, and that the helper hides the guest twice but leaves the presenter, its
+owned window and a dialog visible.
 
 ## Null Texture2D descriptors
 
@@ -677,6 +684,11 @@ the process could not be created, 0 when the debugger finished its report, whate
 did. Check with `python3 -B tests/startup_run_ps1_check.py` (ctest `startup_run_ps1`): on Windows it
 runs the script on a stub debugger under Windows PowerShell and `pwsh`, elsewhere it checks the
 script text only.
+`tools/startup/run.sh` is the Linux counterpart ([Launch environment](wine.md#launch-environment)).
+`python3 -B tests/startup_run_sh_check.py` (ctest `startup_run_sh`, a skip on Windows) runs it under bash
+with a stub Wine, debugger and watcher. It checks the exit code, the debugger's arguments and environment,
+and that the watcher and its child run during the debugger call and are gone after the script exits, also
+after a Ctrl-C. Mutated copies of the script must fail.
 
 `tools/startup/live_view.py` follows a run in a second console. `X2W_TRAP_DUMP="exe+RVA:len,reg+off:len"`
 adds memory dumps to the stop report.
@@ -971,6 +983,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
+| `X2W_HIDE_TITLE_WINDOW=1` (`run.sh --hide-title-window`) | once a frame is shown in the output window, hides the title's own window and keeps it hidden; dialogs stay visible ([Output window and fallback diagnostics](#output-window-and-fallback-diagnostics)). Off by default on every host |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call. Rewrites regular-IAT `GetProcAddress` and a direct `xgameruntime.dll!QueryApiImpl` import on the main EXE and on DLLs that share its directory (package helpers). Dynamic `QueryApiImpl` / `InitializeApiImpl*` are wrapped only when the provider module's basename is `xgameruntime.dll`. `LdrRegisterDllNotification` only flags that another scan is needed. A worker holds each matching module live while rewriting after linking. Loading a helper and immediately calling it can precede the scan. The enabled proxy stays loaded until process exit. Delay-import IAT slots are not rewritten. Skips this stand-in's own `GetProcAddress` IAT so the hook does not recurse (`src/startup_stubs/runtime_gpa_patch.h`, `ctest --preset dev --no-tests=error -R '^startup_runtime_gpa_patch(_name_only_control)?$'`, and the control must print `FAIL:`; Windows also runs `startup_runtime_proxy_scope` for a late-loaded helper through the real loader) |
