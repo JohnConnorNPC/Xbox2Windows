@@ -35,10 +35,30 @@ int main()
     DestroyWindow(second);
     DestroyWindow(guest);
     if (x2w_startup::overlay_window()) return 5;
+    // X2W_HIDE_TITLE_WINDOW: the switch is off unless it is 1 (negative controls first).
+    SetEnvironmentVariableA("X2W_HIDE_TITLE_WINDOW", nullptr);
+    if (x2w_startup::hide_title_window_requested()) return 8;
+    SetEnvironmentVariableA("X2W_HIDE_TITLE_WINDOW", "0");
+    if (x2w_startup::hide_title_window_requested()) return 9;
+    SetEnvironmentVariableA("X2W_HIDE_TITLE_WINDOW", "1");
+    if (!x2w_startup::hide_title_window_requested()) return 10;
+    // Only the guest is hidden: the presenter, a window it owns and a dialog stay visible.
+    HWND title = make(L"STATIC", nullptr, true);
+    HWND dialog = make(x2w_startup::dialog_class, nullptr, true);
+    if (!title || !dialog || !IsWindowVisible(title) || !IsWindowVisible(dialog)) return 11;
+    if (x2w_startup::hide_title_windows() != 1 || IsWindowVisible(title)) return 12;
+    if (!IsWindowVisible(output) || !IsWindowVisible(owned) || !IsWindowVisible(dialog)) return 13;
+    // Shown again by the title, hidden again by the next call; nothing left to hide after that.
+    ShowWindow(title, SW_SHOWNOACTIVATE);
+    if (x2w_startup::hide_title_windows() != 1 || IsWindowVisible(title)) return 14;
+    if (x2w_startup::hide_title_windows() != 0) return 15;
+    DestroyWindow(dialog);
+    DestroyWindow(title);
     DestroyWindow(owned);
     DestroyWindow(hidden);
     DestroyWindow(output);
     std::puts("GDI overlay selected the guest below or above the presenter and the upper of two guests; "
-              "no target after guest destruction");
+              "no target after guest destruction; X2W_HIDE_TITLE_WINDOW=1 only: hid the guest twice, "
+              "kept the presenter, its owned window and a dialog visible");
     return 0;
 }
