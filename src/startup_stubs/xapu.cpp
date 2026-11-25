@@ -216,12 +216,13 @@ long decode_packet(Connection& conn, const unsigned char* c, std::uint32_t& byte
 #endif
 
 // Activity counter (#1145), off unless X2W_AUDIO_ACTIVITY=1: every XApuEnqueueCommand call, counted by command class,
-// taken as the first UINT32 of the command (a stand-in convention, like the result type above), with no cap.
-// Classes 0..15 are counted one by one and larger ones together; a command that cannot be read and a call with an
-// unknown handle are counted apart. commands= in the line is the classes plus the unreadable ones; rejected calls are
-// not in it. There is no thread: the first counted call (or x2w_xapu_command_counts) at least a second after the
-// previous line writes one line with the counts since then, if a count moved, so nothing here runs outside a call into
-// this DLL. Off, nothing here runs: no read of the command, no line.
+// taken as the first UINT32 of the command (a stand-in convention, like the result type above), with no cap. Classes
+// 0..15 are counted one by one and larger ones together; a command that cannot be read and a call with an unknown
+// handle are counted apart. commands= in the line is the classes plus the unreadable ones; rejected calls are not in
+// it. There is no thread: a counted call (or x2w_xapu_command_counts) at least a second after the previous line (or the
+// first such call) writes the next line, with the counts since that line, if a count moved; until then the counts wait
+// for a later call. Nothing here runs outside a call into this DLL. Off, nothing here runs: no read of the command, no
+// line.
 constexpr unsigned command_classes = 16;
 struct CommandCounts {
     u64 by_class[command_classes + 1];  // the last entry: every larger class
@@ -229,7 +230,7 @@ struct CommandCounts {
 };
 SRWLOCK count_lock = SRWLOCK_INIT;  // guards the four below
 CommandCounts command_counts, reported;  // the counts now and at the last line
-ULONGLONG last_line;                     // GetTickCount64 of the last line, or of the first counted call
+ULONGLONG last_line;  // GetTickCount64 of the last line written, or of the first counted call or counter-on export call
 bool counting_started;
 
 bool activity_on() noexcept { return x2w_local::env_on("X2W_AUDIO_ACTIVITY"); }
@@ -243,10 +244,9 @@ bool poll_locked(char (&text)[512]) noexcept
         counting_started = true;
         last_line = tick;
     }
-    if (tick - last_line < 1000) return false;
-    last_line = tick;
     const CommandCounts& now = command_counts;
-    if (!std::memcmp(&now, &reported, sizeof(now))) return false;
+    if (tick - last_line < 1000 || !std::memcmp(&now, &reported, sizeof(now))) return false;
+    last_line = tick;
     char classes[320] = "";
     std::size_t used = 0;
     u64 commands = now.unreadable - reported.unreadable;
@@ -471,8 +471,8 @@ extern "C" __declspec(noinline) long XApuDisconnect(u64 rcx, u64 rdx, u64 r8, u6
 }
 
 // Experimental export for the source-built check (tests/startup_acphal_xma_activity.cpp): writes the line if one is
-// due, as a counted call does, and the totals since start to out[0..18]: commands of classes 0..15, of larger classes, unreadable commands, calls with an unknown
-// handle. With X2W_AUDIO_ACTIVITY off it writes zeros and returns FALSE.
+// due, as a counted call does, and the totals since start to out[0..18]: commands of classes 0..15, of larger classes,
+// unreadable commands, calls with an unknown handle. With X2W_AUDIO_ACTIVITY off it writes zeros and returns FALSE.
 extern "C" BOOL WINAPI x2w_xapu_command_counts(ULONGLONG* out)
 {
     if (!out) return FALSE;

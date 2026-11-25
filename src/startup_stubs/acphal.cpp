@@ -116,10 +116,11 @@ bool heap_give(const void* virtual_address)
 // AcpHalAllocateShapeContexts hands out and counts how its 64-byte contexts change, without reading any field
 // in them: a context that goes from all zero to nonzero is filled, one that changes while nonzero is changed,
 // one that returns to all zero is cleared. HAL slot2 submits are counted by their type argument. There is no thread:
-// the array is compared with a copy inside the calls that count (a HAL submit, AcpHalAllocateShapeContexts, ApuFree of
-// the array, x2w_acphal_xma_activity), at most once per 10 ms except where a call below says it samples now. A context
-// written across a sample counts twice, and one filled and cleared between two samples not at all. The first of those
-// calls at least a second after the previous line writes one line with the counts since then, if a count moved.
+// the array is compared with a copy inside the calls that count (a HAL submit, AcpHalAllocateShapeContexts, every
+// ApuFree once counting started, x2w_acphal_xma_activity), at most once per 10 ms except where a call below says it
+// samples now. A context written across a sample counts twice, and one filled and cleared between two samples not at
+// all. Such a call at least a second after the previous line (or the first counted event) writes the next line, with
+// the counts since that line, if a count moved; until then the counts wait for a later call.
 // Nothing here runs outside a call into this DLL, so a caller that unloads it leaves no code of it running. Off,
 // nothing here runs: no read of caller memory, no line.
 bool activity_on() noexcept { return x2w_local::env_on("X2W_AUDIO_ACTIVITY"); }
@@ -135,7 +136,8 @@ const volatile u64* watched;           // the XMA contexts, or null
 u64* shadow;                           // their words at the last sample
 std::uint32_t watched_count, live;
 Activity activity, reported;           // the counts now and at the last line
-ULONGLONG last_sample, last_line;      // GetTickCount64 of the last sample and of the last line (or the first event)
+ULONGLONG last_sample, last_line;      // GetTickCount64 of the last sample and of the last line written
+                                       // (or of the first counted event)
 volatile LONG activity_started;  // set with the first counted event, never cleared
 
 // Compares the watched contexts with the copy and counts the ones that moved. Hold activity_lock.
@@ -167,9 +169,8 @@ bool poll_locked(bool now, char (&text)[512]) noexcept
         sample_locked();
         last_sample = tick;
     }
-    if (tick - last_line < 1000) return false;
+    if (tick - last_line < 1000 || !std::memcmp(&activity, &reported, sizeof(activity))) return false;
     last_line = tick;
-    if (!std::memcmp(&activity, &reported, sizeof(activity))) return false;
     char types[256] = "";
     std::size_t used = 0;
     u64 submits = 0;
@@ -218,7 +219,8 @@ void watch(unsigned char* contexts, std::uint32_t count) noexcept
     SetLastError(error);
 }
 
-// ApuFree of the watched array: its last changes count, then watching stops before the block can be reused.
+// Every ApuFree once counting started: samples (now, if the block is the watched array) and may write the line. ApuFree
+// of the watched array: its last changes count, then watching stops before the block can be reused.
 void unwatch(const void* block) noexcept
 {
     if (!activity_started) return;

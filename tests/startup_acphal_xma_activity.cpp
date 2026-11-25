@@ -422,7 +422,7 @@ int run_case(const char* name, const char* acphal_path, const char* xapu_path, c
                 {"xapu.other", 1},   {"xapu.unreadable", 1},   {"xapu.rejected", 1}};
             std::map<std::string, u64> got;
             int lines = 0;
-            for (int waited = 0; waited <= 5000; waited += 100) {  // a call a second after the last line writes the next
+            for (int waited = 0; waited <= 5000; waited += 100) {  // a call a second after the start writes the line
                 take(api.acphal_activity);
                 take(api.xapu_counts);
                 got = activity_sums(read_file(log_path), &lines);

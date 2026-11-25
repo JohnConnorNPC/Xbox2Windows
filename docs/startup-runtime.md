@@ -2321,17 +2321,19 @@ ctest --preset dev --no-tests=error -R '^startup_acphal_apu_free$' -V
 
 With `X2W_AUDIO_ACTIVITY=1` as well, the stand-ins count what a caller does with the audio processor without decoding
 anything. `AcpHal.dll` keeps a copy of the XMA context array that `AcpHalAllocateShapeContexts` hands out and compares
-the array with it inside the calls that count (HAL submits, `AcpHalAllocateShapeContexts`, `ApuFree` of the array and
-`x2w_acphal_xma_activity`), at most once per 10 ms. Each 64-byte context is taken as a whole and no field in it is read: one that
-goes from all zero to nonzero counts as filled, one that changes while nonzero as changed, one that returns to all zero
-as cleared. HAL slot2 submits are counted by their type argument. `xapu.dll` counts every `XApuEnqueueCommand` call by
-command class, taken as the first `UINT32` of the command, with no cap; unreadable commands and unknown handles are
-counted apart; `commands=` is the classes plus the unreadable commands, and `rejected=` calls are not in it. Not counted: in an `X2W_WITH_OPUS` build with `X2W_XAPU_TYPED_COMPLETIONS=1`, a type 3
+the array with it inside the calls that count (HAL submits, `AcpHalAllocateShapeContexts`, every `ApuFree` once counting
+started and `x2w_acphal_xma_activity`), at most once per 10 ms. Each 64-byte context is taken as a whole and no field in
+it is read: one that goes from all zero to nonzero counts as filled, one that changes while nonzero as changed, one that
+returns to all zero as cleared. HAL slot2 submits are counted by their type argument. `xapu.dll` counts every
+`XApuEnqueueCommand` call by command class, taken as the first `UINT32` of the command, with no cap; unreadable commands
+and unknown handles are counted apart; `commands=` is the classes plus the unreadable commands, and `rejected=` calls
+are not in it. Not counted: in an `X2W_WITH_OPUS` build with `X2W_XAPU_TYPED_COMPLETIONS=1`, a type 3
 command too short to decode, which returns `E_POINTER` before the count.
-Neither DLL
-starts a thread: the first counted call at least a second after a DLL's previous line logs one line with the counts
-since then, only when a count moved, so nothing of either DLL runs after a caller unloads it. Changes made after the
-last counted call are not logged. With the fixture's caller, for example:
+Neither DLL starts a thread: a counted call at least a second after a DLL's previous line (or its first
+counted call) logs the next line, with the counts since that line, only when a count moved, so nothing of either DLL
+runs after a caller unloads it. Until then the counts wait for a later call: counts from the last second before a
+caller's final call, and changes after it, are not logged, though the exports still return them. With the fixture's
+caller, for example:
 
 ```
 x2w-audio xma-activity t=1.1 s: contexts filled=5 changed=3 cleared=2 live=0/0; hal submits=4 by type 1=2 3=1 other=1
