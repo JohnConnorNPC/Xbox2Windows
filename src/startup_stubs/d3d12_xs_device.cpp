@@ -13,6 +13,7 @@
 #define X2W_TRAP_MODULE "d3d12_xs.dll"
 #define X2W_TRAP_MODULE_ID 7
 #include "startup_stubs/trap.h"
+#include "x2w_build_rev.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/logical_view_table.h"
 #include "startup_stubs/overlay_window.h"
@@ -3805,9 +3806,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     }
     if (shown_in_window) {
         if (frame % 30 == 0) {
-            wchar_t text[200];
-            swprintf(text, 200, L"Xbox2Windows - frame %ld, %.1f fps, %ld translated draws (title bar is diagnostics, picture is game output)",
-                     frame, frame * 1000.0 / (now - started ? now - started : 1), translated_draws);
+            // About 100 fixed characters, the revision (at most 46) and three numbers fit in 256.
+            wchar_t text[256];
+            swprintf(text, 256, L"Xbox2Windows %ls - frame %ld, %.1f fps, %ld translated draws (title bar is diagnostics, picture is game output)",
+                     x2w_build_rev_w, frame, frame * 1000.0 / (now - started ? now - started : 1), translated_draws);
             SetWindowTextW(output_window(), text);
         }
     } else if (frame % 10 == 1 || (render_mode() && frame % 6 == 0)) {
@@ -4138,8 +4140,8 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
         ? D3D12CreateDevice(adapter ? reinterpret_cast<IUnknown*>(unwrap(reinterpret_cast<u64>(adapter))) : nullptr,
                             D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device))
         : E_NOINTERFACE;
-    log("x2w-d3d12 D3D12XboxCreateDevice adapter=%p params=[%s] riid=%s -> 0x%08lx", static_cast<void*>(adapter), block,
-        text, static_cast<unsigned long>(hr));
+    log("x2w-d3d12 D3D12XboxCreateDevice adapter=%p params=[%s] riid=%s -> 0x%08lx build=%s", static_cast<void*>(adapter),
+        block, text, static_cast<unsigned long>(hr), x2w_build_rev);
     if (FAILED(hr)) return hr;
     if (debug) device->QueryInterface(IID_PPV_ARGS(&info_queue));
     x2w_startup::attach_device(device, out);

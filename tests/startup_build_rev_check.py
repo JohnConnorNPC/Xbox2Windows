@@ -1,6 +1,9 @@
 """The build revision in the presenter window title and the device-create log line.
 
   (no arguments)                       run cmake/x2w_build_rev.cmake against temporary git repositories
+  dll <d3d12_xs.dll> <x2w_build_rev.cpp>
+                                       check that the built shim holds the generated revision and the
+                                       title and log formats that print it
 
 The generator writes `git rev-parse --short=8 HEAD`, "-dirty" for tracked changes only, or "unknown" when
 git is missing or the source directory is not the top of a work tree. It must leave the file untouched
@@ -24,6 +27,15 @@ REV_LINE = re.compile(r'^extern const char x2w_build_rev\[\] = "([^"]*)";$', re.
 WIDE_LINE = re.compile(r'^extern const wchar_t x2w_build_rev_w\[\] = L"([^"]*)";$', re.M)
 SHAPE = re.compile(r"^(?:[0-9a-f]{8,40}(?:-dirty)?|unknown)$")
 OLD_NS = 10**18  # 2001-09-09: a fixed mtime that no write by the generator can produce
+
+# Format strings that print the revision (d3d12_present.inl, d3d12_xs_device.cpp).
+TITLE_FORMATS = {
+    "output-window title": "Xbox2Windows %ls - output",
+    "frame title": "Xbox2Windows %ls - frame %ld, %.1f fps, %ld translated draws "
+                   "(title bar is diagnostics, picture is game output)",
+}
+LOG_FORMAT = "x2w-d3d12 D3D12XboxCreateDevice adapter=%p params=[%s] riid=%s -> 0x%08lx build=%s"
+
 
 def fail(message):
     print(f"FAIL {message}")
@@ -127,9 +139,30 @@ def controls():
     print("startup_build_rev_check: 9 cases ok")
 
 
+def dll(dll_path, source_path):
+    rev = read_rev(source_path)
+    try:
+        data = Path(dll_path).read_bytes()
+    except OSError as error:
+        fail(f"cannot read {dll_path}: {error}")
+    wanted = {
+        "narrow revision": rev.encode("ascii") + b"\0",
+        "UTF-16 revision": rev.encode("utf-16-le") + b"\0\0",
+        "device-create log format": LOG_FORMAT.encode("ascii") + b"\0",
+    }
+    for name, text in TITLE_FORMATS.items():
+        wanted[name] = text.encode("utf-16-le") + b"\0\0"
+    missing = [name for name, needle in wanted.items() if needle not in data]
+    if missing:
+        fail(f"{dll_path} (revision {rev}) lacks: {', '.join(missing)}")
+    print(f"ok {dll_path}: revision {rev}, {len(wanted)} strings")
+
+
 def main(argv):
     if not argv:
         controls()
+    elif argv[0] == "dll" and len(argv) == 3:
+        dll(argv[1], argv[2])
     else:
         print(__doc__)
         return 2
