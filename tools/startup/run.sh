@@ -15,8 +15,9 @@
 #   X2W_FXC          the FXC the shader watcher runs under --translate (docs/startup-runtime.md);
 #                    a host path is passed in its Z: spelling
 #   WINEDLLOVERRIDES, WINEFSYNC, WINEDEBUG  default to the docs/wine.md values when unset
-# Paths may be host paths or drive paths such as 'G:\'; drive paths are read through the
-# prefix's dosdevices links.
+# Paths may be host paths or drive paths such as 'G:\'. The debugger and the watcher get them as
+# given (host paths in their Z: spelling); this script reads and creates drive paths through the
+# prefix's dosdevices links. Needs bash 4.4 or newer, GNU realpath and setsid (Linux).
 #
 # Example:
 #   WINEPREFIX=~/prefix X2W_WIN_PYTHON=~/py/python.exe tools/startup/run.sh \
@@ -112,11 +113,11 @@ unset XDG_RUNTIME_DIR
 [ -n "${PULSE_SERVER:-}" ] || [ ! -S "$pulse" ] || export PULSE_SERVER=unix:$pulse
 config=$(host_path "$data")/MicrosoftGame.config
 if [ -f "$config" ]; then
-    # The first tag of each, as run.ps1 reads them; a caller's value stays when a tag is missing.
-    # A value ends at the next '<', so CRLF line ends do not reach it. Unlike run.ps1's
-    # Get-Content, this does not read a UTF-16 config.
-    title_id=$(sed -n 's/.*<TitleId>\([^<]*\).*/\1/p' "$config" | head -n 1)
-    size_mb=$(sed -n 's/.*<SizeMB>\([^<]*\).*/\1/p' "$config" | head -n 1)
+    # The first tag of each in the file, any case, as run.ps1's -match reads them; a caller's value
+    # stays when a tag is missing. Unlike run.ps1, a value must start on its tag's line, and a
+    # UTF-16 config is not read.
+    title_id=$(grep -oi '<TitleId>[^<]*' "$config" | head -n 1 | cut -d '>' -f 2- | tr -d '\r')
+    size_mb=$(grep -oi '<SizeMB>[^<]*' "$config" | head -n 1 | cut -d '>' -f 2- | tr -d '\r')
     [ -z "$title_id" ] || export X2W_TITLE_ID=$title_id
     [ -z "$size_mb" ] || export X2W_STORAGE_MB=$size_mb
 fi
@@ -135,13 +136,19 @@ fi
 [ -z "$host_cpu" ] || export X2W_HOST_CPU=1
 [ -z "$below_40" ] || export X2W_XMEM_STARTUP_BELOW_40=1
 [ -z "$hide_title" ] || export X2W_HIDE_TITLE_WINDOW=1
+if [ -n "$hide_title" ] && [ -z "$render" ]; then
+    echo "WARNING: --hide-title-window needs --render (no output window without it); it has no effect" >&2
+fi
 if [ -n "$render" ]; then
-    mkdir -p "$shader_cache"
+    mkdir -p "$(host_path "$shader_cache")"
     export X2W_D3D12_RENDER=1 X2W_DRAW_NULL_IDENTITY=1
     X2W_SHADER_CACHE=$(win_path "$shader_cache")
     export X2W_SHADER_CACHE
 fi
-mkdir -p "$log"
+# A trailing separator would put the summary inside the log folder as ".out".
+while [[ ${#log} -gt 1 && $log =~ [^:][/\\]$ ]]; do log=${log%?}; done
+log_host=$(host_path "$log")
+mkdir -p "$log_host"
 
 watcher=""
 # shellcheck disable=SC2329  # called through the EXIT trap
@@ -158,10 +165,17 @@ stop_watcher() {
     return 0
 }
 trap stop_watcher EXIT
-# Ctrl-C reaches the whole foreground group, so the debugger ends and the EXIT trap runs. bash
-# defers a TERM sent to this script alone until the debugger returns.
-trap 'exit 130' INT
-trap 'exit 143' TERM
+# On Ctrl-C: stop the watcher, then end by SIGINT so that a calling shell loop stops too. bash
+# runs the trap once the debugger, which gets the Ctrl-C as well, has returned. A TERM sent to this
+# script alone needs no trap: bash waits for the debugger, runs the EXIT trap and ends by SIGTERM.
+# shellcheck disable=SC2329  # called through the trap below
+on_signal() {
+    stop_watcher
+    watcher=""
+    trap - "$1" EXIT
+    kill -s "$1" $$
+}
+trap 'on_signal INT' INT
 if [ -n "$translate" ] && [ -z "$render" ]; then
     echo "WARNING: --translate needs --render (no shader cache without it); ignored" >&2
 fi
@@ -174,7 +188,7 @@ if [ -n "$translate" ] && [ -n "$render" ]; then
     if [ -n "${X2W_FXC:-}" ]; then X2W_FXC=$(win_path "$X2W_FXC"); export X2W_FXC; fi
     WINEDLLOVERRIDES="$WINEDLLOVERRIDES;d3dcompiler_47=n" \
         setsid "$wine" "$X2W_WIN_PYTHON" -B "$(win_path "$here/gfx2hlsl.py")" --watch "$X2W_SHADER_CACHE" \
-        > "$log/translate.txt" 2> "$log/translate_err.txt" < /dev/null &
+        > "$log_host/translate.txt" 2> "$log_host/translate_err.txt" < /dev/null &
     watcher=$!
 fi
 trace_args=()
@@ -183,7 +197,7 @@ console_args=()
 [ "$console" = 1 ] || console_args=(--console "$console")
 "$wine" "$X2W_WIN_PYTHON" -B "$(win_path "$here/debug_launch.py")" "$(win_path "$exe")" "$(win_path "$data")" \
     "$(win_path "$log")" --timeout "$seconds" --memory-gib "$memory_gib" --trace-files 1 \
-    --continue-asserts "$continue_asserts" "${trace_args[@]}" "${console_args[@]}" > "$log.out" 2>&1
+    --continue-asserts "$continue_asserts" "${trace_args[@]}" "${console_args[@]}" > "$log_host.out" 2>&1
 debugger_exit=$?
-head -n 5 "$log.out"
+head -n 5 "$log_host.out"
 exit $debugger_exit

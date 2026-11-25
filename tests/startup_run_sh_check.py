@@ -29,14 +29,17 @@ CHECKED = PERMISSIVE + [
     "X2W_FAKE_USER", "X2W_XMEM_GPU_MIRROR", "X2W_HOST_CPU", "X2W_XMEM_STARTUP_BELOW_40", "X2W_HIDE_TITLE_WINDOW",
     "X2W_D3D12_RENDER", "X2W_DRAW_NULL_IDENTITY", "X2W_SHADER_CACHE", "X2W_TITLE_ID", "X2W_STORAGE_MB",
     "X2W_STORAGE_PATH", "X2W_INPUT_SCRIPT", "X2W_XMEM_SHARED_VIEWS", "WINEDLLOVERRIDES", "WINEFSYNC", "WINEDEBUG",
-    "WINEPREFIX", "XDG_RUNTIME_DIR", "PULSE_SERVER"]
+    "WINEPREFIX", "XDG_RUNTIME_DIR", "PULSE_SERVER", "X2W_FXC"]
 GAME_OVERRIDES = "d3d12,d3d12core,dxgi,d3d11=n"  # docs/wine.md
 FAKE_USER_WARNING = ("WARNING: Without --fake-user, user API calls go to the host gaming runtime "
                      "(docs/startup-runtime.md).")
 TRANSLATE_WARNING = "WARNING: --translate needs --render (no shader cache without it); ignored"
+HIDE_WARNING = "WARNING: --hide-title-window needs --render (no output window without it); it has no effect"
 # Synthetic package values; not any title's. Only the first of each tag counts, as in run.ps1.
 CONFIG = ("<Game>\r\n<Identity/>\r\n<TitleId>X2WTEST</TitleId>\r\n<TitleId>SECOND</TitleId>\r\n"
           "<PersistentLocalStorage><SizeMB>123</SizeMB></PersistentLocalStorage>\r\n</Game>\r\n")
+# One line, lower-case tags first: run.ps1's -match takes the first tag in any case.
+CONFIG_ONE_LINE = "<Game><titleid>X2WTEST</titleid><TitleId>SECOND</TitleId><sizemb>123</sizemb></Game>\n"
 
 # Stands in for wine: "$WINE" python.exe -B script.py args... runs script.py (a Z: path) on the
 # host Python and passes the other arguments as they are, so the stubs see Windows spellings.
@@ -70,8 +73,9 @@ def alive(pid):
     return True
 """
 # Stands in for tools/startup/debug_launch.py: records its arguments and environment, and under
-# --translate whether the watcher and its child are running. With hold.flag it then waits to be
-# interrupted; otherwise it prints seven lines and exits with the code under test.
+# --translate whether the watcher and its child are running. With hold.flag "int" it then waits for
+# a Ctrl-C and exits 3 as a debugger does that ends its run on one; with "term" it finishes 2 s later
+# and leaves done.flag. Then it prints seven lines and exits with the code under test.
 STUB = """\
 import json
 import os
@@ -92,16 +96,22 @@ if here.with_name("translate.flag").exists():
         time.sleep(0.3)  # a watcher stopped right after its start is gone by now
         pids = json.loads(here.with_name("watch.json").read_text(encoding="utf-8"))[:2]
         here.with_name("alive.json").write_text(json.dumps([alive(pid) for pid in pids]), encoding="utf-8")
-if here.with_name("hold.flag").exists():
+hold = here.with_name("hold.flag").read_text() if here.with_name("hold.flag").exists() else ""
+code = {code}
+if hold:
     here.with_name("ready.flag").write_bytes(b"")
-    time.sleep(60)
+    try:
+        time.sleep(60 if hold == "int" else 2)
+    except KeyboardInterrupt:
+        code = 3
+    here.with_name("done.flag").write_bytes(b"")
 for n in range(1, 8):
     print("stub debugger line", n)
-sys.exit({code})
+sys.exit(code)
 """
 # Stands in for tools/startup/gfx2hlsl.py under --translate: starts a child process, as the parallel
 # workers are, records its own and the child's process ids, its arguments and environment, then
-# waits to be stopped.
+# waits to be stopped. Both ignore SIGTERM, so only run.sh's SIGKILL fallback stops them.
 WATCH_STUB = """\
 import json
 import os
@@ -110,6 +120,8 @@ import sys
 import time
 from pathlib import Path
 
+import signal
+signal.signal(signal.SIGTERM, signal.SIG_IGN)  # inherited by the child as ignored
 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
 here = Path(__file__)
 here.with_name("watch_env.json").write_text(json.dumps({{k: v for k, v in os.environ.items()
@@ -140,7 +152,8 @@ def read_json(path):
 
 
 def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_data=False, config=CONFIG,
-             translate=False, interrupt=False, expect_env=None, expect_warnings=None, expect_exit=None):
+             translate=False, stop=None, drive_log=False, log_slash=False, expect_env=None, expect_warnings=None,
+             expect_exit=None):
     """Run one copy of the script on a stub that exits with `code`; return what is wrong."""
     root = Path(tempfile.mkdtemp(dir=work)).resolve()
     startup = root / "tools" / "startup"
@@ -170,16 +183,22 @@ def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_d
     if translate:
         env["X2W_FXC"] = str(root / "sdk" / "fxc.exe")
     env.update(env_extra or {})
+    # --log as a drive path is the folder "logs" of the G: drive, that is of the data folder.
+    # A trailing separator is dropped (a host path loses it in realpath, a drive path in run.sh).
+    log_arg, log_win = (("G:\\logs" + ("\\" if log_slash else ""), "G:\\logs") if drive_log else
+                        (str(log) + ("/" if log_slash else ""), win(log)))
+    if drive_log:
+        log = data / "logs"
     command = ["bash", str(startup / "run.sh"), "--exe", str(exe), "--data", "G:\\" if drive_data else str(data),
-               "--log", str(log), "--build-dir", "bld", "--seconds", "9", "--memory-gib", "3",
+               "--log", log_arg, "--build-dir", "bld", "--seconds", "9", "--memory-gib", "3",
                "--continue-asserts", "4", *switches]
     if translate:
         command += ["--render", "--translate", "--shader-cache", "cache"]
         (startup / "translate.flag").write_bytes(b"")
-    if interrupt:
-        (startup / "hold.flag").write_bytes(b"")
+    if stop:
+        (startup / "hold.flag").write_text(stop)
     label = f"stub exit {code} {' '.join(switches)}{' --translate' if translate else ''}" \
-            f"{' (Ctrl-C)' if interrupt else ''}".strip()
+            f"{f' ({stop})' if stop else ''}{' --log G:' if drive_log else ''}".strip()
     # A surviving watcher can keep a capture pipe open after bash exits: capture to files.
     with (tempfile.TemporaryFile(mode="w+", errors="replace", dir=root) as stdout,
           tempfile.TemporaryFile(mode="w+", errors="replace", dir=root) as stderr):
@@ -187,12 +206,16 @@ def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_d
         process = subprocess.Popen(command, cwd=root, env=env, stdout=stdout, stderr=stderr,
                                    start_new_session=True)
         try:
-            if interrupt:
+            if stop:
                 deadline = time.time() + 30
                 while not (startup / "ready.flag").exists() and time.time() < deadline:
                     time.sleep(0.05)
-                os.killpg(process.pid, signal.SIGINT)
+                if stop == "int":  # a terminal's Ctrl-C reaches the whole foreground group
+                    os.killpg(process.pid, signal.SIGINT)
+                else:  # TERM to run.sh alone
+                    os.kill(process.pid, signal.SIGTERM)
             returncode = process.wait(timeout=120)
+            debugger_done = (startup / "done.flag").exists()
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             return [f"{label}: run.sh did not finish in 120 s"]
@@ -201,7 +224,8 @@ def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_d
         printed = [line.strip() for line in stdout if line.strip()]
         warnings = [line.strip() for line in stderr if line.strip()]
     found = []
-    want_exit = 130 if interrupt else code if expect_exit is None else expect_exit
+    # After INT or TERM, run.sh ends by the same signal.
+    want_exit = {"int": -signal.SIGINT, "term": -signal.SIGTERM}.get(stop, code if expect_exit is None else expect_exit)
     if returncode != want_exit:
         found.append(f"{label}: expected exit {want_exit}, run.sh exited {returncode} ({warnings[-3:]})")
     if expect_exit is not None:  # a refused run must not reach the debugger
@@ -213,9 +237,19 @@ def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_d
     if expect_warnings is None:
         fake = "--fake-user" in switches or (env_extra or {}).get("X2W_FAKE_USER") == "1"
         expect_warnings = [] if fake else [FAKE_USER_WARNING]
+        if "--hide-title-window" in switches and "--render" not in switches and not translate:
+            expect_warnings.append(HIDE_WARNING)
     if warnings != expect_warnings:
         found.append(f"{label}: warnings {warnings}, expected {expect_warnings}")
-    if not interrupt:
+    if stop == "term" and not debugger_done:
+        found.append(f"{label}: run.sh ended before the debugger finished")
+    if drive_log:
+        if "G:\\cache" in switches and not (data / "cache").is_dir():
+            found.append(f"{label}: the drive-path shader cache was not created in the G: drive")
+        stray = [p.name for p in root.iterdir() if p.name.startswith("G:")]
+        if stray:
+            found.append(f"{label}: drive-path log written to the working directory as {stray}")
+    if not stop:
         if printed != STUB_LINES[:HEAD_LINES]:
             found.append(f"{label}: printed {printed}, expected the first {HEAD_LINES} debugger lines")
         summary = Path(str(log) + ".out")
@@ -225,7 +259,7 @@ def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_d
     missing = [dll for dll in DLLS if not (exe.parent / f"{dll}.dll").is_file()]
     if missing:
         found.append(f"{label}: stand-in DLLs not copied next to the executable: {missing}")
-    want = [win(exe), "G:\\" if drive_data else win(data), win(log), "--timeout", "9", "--memory-gib", "3",
+    want = [win(exe), "G:\\" if drive_data else win(data), log_win, "--timeout", "9", "--memory-gib", "3",
             "--trace-files", "1", "--continue-asserts", "4", *passed]
     got = read_json(startup / "argv.json")
     if got != want:
@@ -265,8 +299,11 @@ def run_case(script, code, work, switches=(), passed=(), env_extra=None, drive_d
                 except OSError:
                     pass
                 found.append(f"--translate: the {what} was still running after run.sh exited")
-    elif watch.is_file():
-        found.append(f"{label}: the translator started without --render --translate")
+    else:
+        if "--translate" in switches:
+            time.sleep(1)  # the stub debugger does not wait for a watcher here
+        if watch.is_file():
+            found.append(f"{label}: the translator started without --render --translate")
     return found
 
 
@@ -290,14 +327,26 @@ CASES = [
     # A caller's Wine settings stay.
     dict(code=0, env_extra={"WINEDLLOVERRIDES": "x=b", "WINEFSYNC": "0", "WINEDEBUG": "+seh"},
          expect_env={"WINEDLLOVERRIDES": "x=b", "WINEFSYNC": "0", "WINEDEBUG": "+seh"}),
-    dict(code=0, switches=["--translate"], expect_warnings=[FAKE_USER_WARNING, TRANSLATE_WARNING]),
+    # A caller's X2W_SHADER_CACHE lets a watcher started without --render get past `set -u`.
+    dict(code=0, switches=["--translate"], env_extra={"X2W_SHADER_CACHE": "C:\\c"},
+         expect_env={"X2W_SHADER_CACHE": "C:\\c"}, expect_warnings=[FAKE_USER_WARNING, TRANSLATE_WARNING]),
+    dict(code=0, switches=["--hide-title-window"], expect_env={"X2W_HIDE_TITLE_WINDOW": "1"},
+         expect_warnings=[FAKE_USER_WARNING, HIDE_WARNING]),
+    # Drive paths for --log and --shader-cache are created through the prefix; the debugger gets them as given.
+    dict(code=7, drive_log=True, switches=["--render", "--shader-cache", "G:\\cache"],
+         expect_env={"X2W_D3D12_RENDER": "1", "X2W_DRAW_NULL_IDENTITY": "1", "X2W_SHADER_CACHE": "G:\\cache"}),
+    # A trailing separator on --log still puts the summary beside the folder.
+    dict(code=7, log_slash=True),
+    dict(code=7, drive_log=True, log_slash=True),
+    dict(code=0, config=CONFIG_ONE_LINE),
     dict(code=0, switches=["--render", "--shader-cache", "cache"],
          expect_env={"X2W_D3D12_RENDER": "1", "X2W_DRAW_NULL_IDENTITY": "1",
                      "X2W_SHADER_CACHE": lambda root: win(root / "cache")}),
     dict(code=0, env_extra={"WINEPREFIX": ""}, expect_exit=64, expect_warnings=["run.sh: set WINEPREFIX"]),
     dict(code=0, env_extra={"X2W_WIN_PYTHON": ""}, expect_exit=64, expect_warnings=["run.sh: set X2W_WIN_PYTHON"]),
     dict(code=7, translate=True),
-    dict(code=7, translate=True, interrupt=True),
+    dict(code=7, translate=True, stop="int"),
+    dict(code=7, translate=True, stop="term"),
 ]
 
 
@@ -334,7 +383,16 @@ def mutants_of(script):
         "watcher without --render": replace(script, 'if [ -n "$translate" ] && [ -n "$render" ]; then',
                                             'if [ -n "$translate" ]; then'),
         "config not read": replace(script, 'if [ -f "$config" ]; then', "if false; then"),
-        "last tag wins": replace(script, "\\1/p' \"$config\" | head -n 1)", "\\1/p' \"$config\" | tail -n 1)", count=2),
+        "last tag wins": replace(script, "| head -n 1 | cut", "| tail -n 1 | cut", count=2),
+        "greedy one-line match": replace(script, "title_id=$(grep -oi '<TitleId>[^<]*' \"$config\" | head -n 1 | cut -d '>' -f 2- | tr -d '\\r')",
+                                         "title_id=$(sed -n 's/.*<TitleId>\\([^<]*\\).*/\\1/p' \"$config\" | head -n 1)"),
+        "case-sensitive tags": replace(script, "grep -oi '<", "grep -o '<", count=2),
+        "no hide warning": replace(script, '    echo "WARNING: --hide-title-window', '    : "WARNING: --hide-title-window'),
+        "log through the raw path": replace(script, 'log_host=$(host_path "$log")', 'log_host=$log'),
+        "cache through the raw path": replace(script, 'mkdir -p "$(host_path "$shader_cache")"', 'mkdir -p "$shader_cache"'),
+        "trailing separator kept": drop_line(script, "do log=${log%?}; done"),
+        "no KILL fallback": drop_line(script, 'kill -KILL -- "-$watcher"'),
+        "INT ends with exit 130": replace(script, '    kill -s "$1" $$', '    exit 130'),
         "XDG_RUNTIME_DIR kept": drop_line(script, "unset XDG_RUNTIME_DIR"),
         "--console 0 not passed": drop_line(script, 'console_args=(--console "$console")'),
         "drive path through Z:": replace(script, "    if [[ $1 =~ ^[A-Za-z]: ]]; then", "    if false; then"),
@@ -347,7 +405,7 @@ def mutants_of(script):
         # Started, then stopped before the debugger: only the positive control sees it.
         "watcher stopped before the debugger": replace(script, "    watcher=$!\n",
                                                        "    watcher=$!\n    sleep 1; stop_watcher\n"),
-        "no INT trap": drop_line(script, "trap 'exit 130' INT"),
+        "no INT trap": drop_line(script, "trap 'on_signal INT' INT"),
         "no EXIT trap": drop_line(script, "trap stop_watcher EXIT"),
         "parent-only kill": replace(script, '-- "-$watcher"', '-- "$watcher"', count=3),
         "no setsid": replace(script, '        setsid "$wine"', '        "$wine"'),
