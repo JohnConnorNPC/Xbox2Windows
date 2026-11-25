@@ -1272,7 +1272,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_HIDE_TITLE_WINDOW=1` (`run.sh --hide-title-window`) | once a present has reached the output window, hides the title's own window; dialogs stay visible, and the window is shown again when a present misses the output window, until the next present reaches it ([Output window and fallback diagnostics](#output-window-and-fallback-diagnostics)). Keyboard input to the title after the hide is not measured. Off by default on every host |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. `XDspDeactivate` and `XDspDisconnect` refuse null and unknown handles with `E_INVALIDARG`. |
-| `X2W_AUDIO_ACTIVITY=1` | with `X2W_AUDIO_PERMISSIVE=1`, counts XMA context changes, HAL submits and XApu commands, and logs a line per second when a count moved ([Activity counter](#activity-counter)) |
+| `X2W_AUDIO_ACTIVITY=1` | with `X2W_AUDIO_PERMISSIVE=1`, counts XMA context changes, HAL submits and XApu commands, and logs at most a line per second when a count moved ([Activity counter](#activity-counter)) |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call. Rewrites regular-IAT `GetProcAddress` and a direct `xgameruntime.dll!QueryApiImpl` import on the main EXE and on DLLs that share its directory (package helpers). Dynamic `QueryApiImpl` / `InitializeApiImpl*` are wrapped only when the provider module's basename is `xgameruntime.dll`. `LdrRegisterDllNotification` only flags that another scan is needed. A worker holds each matching module live while rewriting after linking. Loading a helper and immediately calling it can precede the scan. The enabled proxy stays loaded until process exit. Delay-import IAT slots are not rewritten. Skips this stand-in's own `GetProcAddress` IAT so the hook does not recurse (`src/startup_stubs/runtime_gpa_patch.h`, `ctest --preset dev --no-tests=error -R '^startup_runtime_gpa_patch(_name_only_control)?$'`, and the control must print `FAIL:`; Windows also runs `startup_runtime_proxy_scope` for a late-loaded helper through the real loader) |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_RUNTIME_LOCAL=1` | with `X2W_RUNTIME_PROXY` and `X2W_FAKE_USER`, for a host where the system gaming runtime cannot initialize (no Gaming Services). The first failed `InitializeApiImpl*` is reported as `S_OK`, and every later initialization call returns `S_OK` without calling the real export. Once initialization failure is latched, a failed real `QueryApiImpl` call can fall back only with an exact match of both GUIDs to a supported provider/interface pair for user (including gamertag), game save, package, title, connectivity or store. Persistent local storage uses its existing fake-user gate and requires its exact provider GUID and IID. Unmatched failed queries keep the real HRESULT. The proxy clears a writable output on failure only when fake user is enabled and the initialization failure is latched. A local object's `QueryInterface` accepts only `IID_IUnknown` and the IID it was created for. The local answers above apply, calls that carry the local user or store handle fail as before, and other unanswered methods return `E_NOTIMPL`. `XUserAddAsync` and async operations completed on behalf of a local answer require the real runtime's `QueryApiImpl` to return the XAsync provider (`073b7dcb`). Those operations complete with `S_OK` through XAsync, or return the query failure if XAsync is unavailable (`ctest --preset dev --no-tests=error -R '^startup_runtime_local(_control)?$'`, and the control must print `FAIL:`). |
@@ -2319,33 +2319,39 @@ ctest --preset dev --no-tests=error -R '^startup_acphal_apu_free$' -V
 
 ### Activity counter
 
-With `X2W_AUDIO_ACTIVITY=1` as well, the stand-ins count what a caller does with the audio processor without
-decoding anything. `AcpHal.dll` keeps a copy of the XMA context array that `AcpHalAllocateShapeContexts` hands out and
-compares the array with it about every 10 ms. Each 64-byte context is taken as a whole and no field in it is read: one
-that goes from all zero to nonzero counts as filled, one that changes while nonzero as changed, one that returns to all
-zero as cleared. HAL slot2 submits are counted by their type argument. `xapu.dll` counts every `XApuEnqueueCommand`
-call by command class, taken as the first `UINT32` of the command, with no cap; unreadable commands and unknown handles
-are counted apart. Not counted: in an `X2W_WITH_OPUS` build with `X2W_XAPU_TYPED_COMPLETIONS=1`, a type 3
+With `X2W_AUDIO_ACTIVITY=1` as well, the stand-ins count what a caller does with the audio processor without decoding
+anything. `AcpHal.dll` keeps a copy of the XMA context array that `AcpHalAllocateShapeContexts` hands out and compares
+the array with it inside the calls that count (HAL submits, `AcpHalAllocateShapeContexts`, `ApuFree` of the array and
+`x2w_acphal_xma_activity`), at most once per 10 ms. Each 64-byte context is taken as a whole and no field in it is read: one that
+goes from all zero to nonzero counts as filled, one that changes while nonzero as changed, one that returns to all zero
+as cleared. HAL slot2 submits are counted by their type argument. `xapu.dll` counts every `XApuEnqueueCommand` call by
+command class, taken as the first `UINT32` of the command, with no cap; unreadable commands and unknown handles are
+counted apart; `commands=` is the classes plus the unreadable commands, and `rejected=` calls are not in it. Not counted: in an `X2W_WITH_OPUS` build with `X2W_XAPU_TYPED_COMPLETIONS=1`, a type 3
 command too short to decode, which returns `E_POINTER` before the count.
-Once a second, each DLL logs one line with the counts since its previous line, only when a count
-moved. With the fixture's caller, for example:
+Neither DLL
+starts a thread: the first counted call at least a second after a DLL's previous line logs one line with the counts
+since then, only when a count moved, so nothing of either DLL runs after a caller unloads it. Changes made after the
+last counted call are not logged. With the fixture's caller, for example:
 
 ```
-x2w-audio xma-activity t=1.0 s: contexts filled=5 changed=3 cleared=2 live=3/350; hal submits=4 by type 1=2 3=1 other=1
-x2w-audio xapu-activity t=1.0 s: commands=7 by class 1=3 2=2 other=1 unreadable=1; rejected=1
+x2w-audio xma-activity t=1.1 s: contexts filled=5 changed=3 cleared=2 live=0/0; hal submits=4 by type 1=2 3=1 other=1
+x2w-audio xapu-activity t=1.1 s: commands=7 by class 1=3 2=2 other=1 unreadable=1; rejected=1 (not in commands)
 ```
 
-`t` is seconds since the process started, the same base in both DLLs. A context written across a sample counts twice,
-and one filled and cleared between two samples is not counted. `ApuFree` of the array ends the count before the block
-can be reused. The totals are also returned by the experimental exports `x2w_acphal_xma_activity` and
-`x2w_xapu_command_counts`. The 64-byte stride and the command class are stand-in conventions, not a console layout, and
-no field inside a context, such as an enable flag, is identified. With the variable unset nothing runs: no thread, no
-read of caller memory, no line.
+`t` is seconds since the process started, the same base in both DLLs; the fixture's line comes after its `ApuFree`, so
+no context is watched (`live=0/0`). A context written across a sample counts twice, and one filled and cleared between
+two samples is not counted. `ApuFree` of the array ends the count before the block can be reused, and a second
+`AcpHalAllocateShapeContexts` samples the old array once more and then watches only the new one. The totals are also
+returned by the experimental exports `x2w_acphal_xma_activity` and `x2w_xapu_command_counts`. The 64-byte stride and the
+command class are stand-in conventions, not a console layout, and no field inside a context, such as an enable flag, is
+identified. With the variable unset nothing runs: no read of caller memory, no line.
 
-The source-built check runs one caller script in three child processes: counter on (the exports and the logged lines
-give exactly what the script did, and an array freed and allocated again is no longer counted), counter on with a caller
-that writes only the 64 bytes after the last context and sends nothing (every count 0, no line), and counter off (no
-count, no line). Every result, output, last error and the final context bytes must match between the on and off runs:
+The source-built check runs four child processes: counter on (the exports and the logged lines give exactly what the
+caller script did, and an array freed and allocated again is no longer counted), counter on with a caller that writes
+only the 64 bytes after the last context and sends nothing (every count 0, no line), counter off (no count, no line),
+and an unload case. That one allocates the contexts twice without `ApuFree` (the old array's unsampled change counts,
+later ones do not), then frees both DLLs, checks that they are unmapped, waits 1.5 s and must exit 0. Every result,
+output, last error and the final context bytes must match between the on and off runs:
 
 ```
 ctest --preset release --no-tests=error -R '^startup_acphal_xma_activity$' -V

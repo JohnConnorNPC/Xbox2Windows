@@ -923,8 +923,9 @@ target_compile_features(startup_chad_check PRIVATE cxx_std_17)
 add_dependencies(startup_chad_check startup_stub_chad)
 add_test(NAME startup_chad_check COMMAND startup_chad_check "$<TARGET_FILE:startup_stub_chad>")
 set_tests_properties(startup_chad_check PROPERTIES TIMEOUT 60)
-# Activity counter of the AcpHal and XApu stand-ins (X2W_AUDIO_ACTIVITY=1): exact counts, a zero-write control, and
-# the same results with the counter on and off (docs/startup-runtime.md).
+# Activity counter of the AcpHal and XApu stand-ins (X2W_AUDIO_ACTIVITY=1): exact counts, a zero-write control, the
+# same results with the counter on and off, and a caller that unloads both DLLs and must exit cleanly
+# (docs/startup-runtime.md).
 add_executable(startup_acphal_xma_activity tests/startup_acphal_xma_activity.cpp)
 target_compile_features(startup_acphal_xma_activity PRIVATE cxx_std_17)
 add_dependencies(startup_acphal_xma_activity startup_stub_acphal startup_stub_xapu)
