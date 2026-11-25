@@ -74,10 +74,10 @@ class Repo:
             fail(f"git {' '.join(args)} in {cwd}: {result.stderr.strip()}")
         return result.stdout.strip()
 
-    def generate(self, case, source, output, git=None):
+    def generate(self, case, source, output, git=None, env=None):
         result = subprocess.run([self.cmake, f"-DSOURCE_DIR={source}", f"-DOUTPUT={output}",
                                  f"-DGIT_EXECUTABLE={self.git if git is None else git}", "-P", str(SCRIPT)],
-                                env=self.env, capture_output=True, text=True)
+                                env={**self.env, **(env or {})}, capture_output=True, text=True)
         if result.returncode != 0:
             fail(f"{case}: generator exited {result.returncode}: {result.stderr.strip()}")
         return read_rev(output, case)
@@ -135,8 +135,11 @@ def controls():
         nested.mkdir()
         expect("directory inside another repository", repo.generate("directory inside another repository", nested, output), "unknown")
 
+        inherited = {"GIT_DIR": str(tree / ".git"), "GIT_WORK_TREE": str(tree)}
+        expect("inherited GIT_DIR", repo.generate("inherited GIT_DIR", plain, output, env=inherited), "unknown")
+
         expect("no git executable", repo.generate("no git executable", tree, output, git=""), "unknown")
-    print("startup_build_rev_check: 9 cases ok")
+    print("startup_build_rev_check: 10 cases ok")
 
 
 def dll(dll_path, source_path):

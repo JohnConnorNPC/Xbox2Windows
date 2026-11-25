@@ -2634,8 +2634,9 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_image_load_d16_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
-    # Build revision generator: clean, dirty, untracked-only, new-commit and no-repository cases in
-    # temporary repositories, and no rewrite of an unchanged file.
+    # Build revision generator in temporary repositories: clean commit, no rewrite of an unchanged file,
+    # untracked-only, tracked edit, new commit, not a repository, a directory inside another repository,
+    # an inherited GIT_DIR and no git executable.
     add_test(NAME startup_build_rev_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_build_rev_check.py")
     set_tests_properties(startup_build_rev_controls PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)

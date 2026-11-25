@@ -5,7 +5,8 @@
 # The revision is `git rev-parse --short=8 HEAD` of SOURCE_DIR, with "-dirty" when tracked files differ
 # from HEAD (untracked files do not count), or "unknown" when GIT_EXECUTABLE is empty, SOURCE_DIR is not
 # the top of a work tree or a git command fails. Git does not search above SOURCE_DIR, so a source tree
-# unpacked inside another repository reports "unknown" rather than that repository's commit.
+# unpacked inside another repository reports "unknown" rather than that repository's commit, and
+# GIT_DIR and its companions inherited from the caller (a build started from a git hook) are ignored.
 # The build runs this on every build. OUTPUT is rewritten only when its text changes, so an unchanged
 # revision recompiles and relinks nothing.
 foreach(required IN ITEMS SOURCE_DIR OUTPUT)
@@ -18,6 +19,9 @@ set(rev unknown)
 if(GIT_EXECUTABLE)
     get_filename_component(source_parent "${SOURCE_DIR}" DIRECTORY)
     set(ENV{GIT_CEILING_DIRECTORIES} "${source_parent}")
+    foreach(variable IN ITEMS GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR)
+        unset(ENV{${variable}})
+    endforeach()
     execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${SOURCE_DIR}" rev-parse --short=8 HEAD
         RESULT_VARIABLE head_result OUTPUT_VARIABLE head ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
     if(head_result EQUAL 0 AND head MATCHES "^[0-9a-f]+$")

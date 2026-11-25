@@ -215,7 +215,7 @@ The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
 Its title starts with `Xbox2Windows <rev>`, where `<rev>` is `git rev-parse --short=8 HEAD` of the
 source tree the shim was built from, with `-dirty` for uncommitted changes to tracked files, or `unknown`
 without git. The `D3D12XboxCreateDevice` log line ends with the same `build=<rev>`. The build refreshes
-the revision on every run (`cmake/x2w_build_rev.cmake`). `ctest --preset dev --no-tests=error -R
+the revision on every build (`cmake/x2w_build_rev.cmake`). `ctest --preset dev --no-tests=error -R
 '^startup_build_rev_' -V` checks the generator and the built `d3d12_xs.dll`.
 The presenter only samples non-empty single-sample 2D surfaces without
 `D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE` and with a supported view format
