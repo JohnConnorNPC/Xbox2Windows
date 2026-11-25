@@ -59,16 +59,29 @@ int main()
     HWND dialog = make(x2w_startup::dialog_class, nullptr, true);
     if (!title || !dialog || !IsWindowVisible(title) || !IsWindowVisible(dialog)) return 11;
     Hider hider;
+    // ShowWindowAsync posts work to the window's owning thread. Drain that
+    // thread's queue before checking whether the posted request took effect.
+    const auto wait_visibility = [](HWND window, bool visible) {
+        const ULONGLONG deadline = GetTickCount64() + 3000;
+        MSG message{};
+        do {
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
+                DispatchMessageW(&message);
+            if ((IsWindowVisible(window) != FALSE) == visible) return true;
+            Sleep(10);
+        } while (GetTickCount64() < deadline);
+        return false;
+    };
     // Before the first frame reaches the output window nothing is hidden.
     if (hider.step(output, 0, 1) != 0 || !IsWindowVisible(title)) return 17;
-    if (hider.step(output, 1, 1) != 1 || IsWindowVisible(title)) return 12;
+    if (hider.step(output, 1, 1) != 1 || !wait_visibility(title, false)) return 12;
     if (!IsWindowVisible(output) || !IsWindowVisible(owned) || !IsWindowVisible(dialog)) return 13;
     // Shown again by the title, hidden again by the next step; nothing left to hide after that.
     ShowWindow(title, SW_SHOWNOACTIVATE);
-    if (hider.step(output, 2, 1) != 1 || IsWindowVisible(title)) return 14;
+    if (hider.step(output, 2, 1) != 1 || !wait_visibility(title, false)) return 14;
     if (hider.step(output, 3, 1) != 0) return 15;
     // A frame that is not shown brings the title window back for the GDI fallback.
-    if (hider.step(output, 4, 0) != -1 || !IsWindowVisible(title)) return 18;
+    if (hider.step(output, 4, 0) != -1 || !wait_visibility(title, true)) return 18;
     // Focus: when the hidden window is in front, the output window takes the foreground first.
     // A host that does not let this process set the foreground cannot show this; it is reported.
     HWND front_output = CreateWindowExW(0, x2w_startup::presenter_class, L"", WS_POPUP, 0, 0, 8, 8,
@@ -81,7 +94,7 @@ int main()
     if (focus_checked) {
         bool refused = true;
         if (hider.step(front_output, 5, 1, &refused) < 1 || refused || GetForegroundWindow() != front_output ||
-            IsWindowVisible(front)) return 21;
+            !wait_visibility(front, false)) return 21;
     }
     DestroyWindow(front);
     DestroyWindow(front_output);
