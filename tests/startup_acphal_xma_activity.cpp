@@ -97,6 +97,13 @@ void note(const char* what, long hr, unsigned long long value = 0)
 }
 void sentinel() { SetLastError(0x5A5A); }
 
+// XApuConnect refuses a shared buffer size of 0 (the u32 at input +0x0C) with E_INVALIDARG; 4 KiB is enough here.
+void set_buffer_size(unsigned char* connect_input)
+{
+    const std::uint32_t bytes = 0x1000;
+    std::memcpy(connect_input + 0x0C, &bytes, sizeof(bytes));
+}
+
 // One aligned 8-byte store, so the sampler sees the context before or after it, never half written.
 void store(unsigned char* base, std::uint32_t context, unsigned word, u64 value)
 {
@@ -253,6 +260,7 @@ void script(const Api& api, bool on)
                {submit_type0 + 3, 1}, {submit_other, 1}});
 
     unsigned char connect_input[0x18]{}, connect_output[0x10]{};
+    set_buffer_size(connect_input);
     u64 handle = 0;
     sentinel();
     note("XApuConnect", api.connect(connect_input, connect_output, &handle), handle);
@@ -331,6 +339,7 @@ void script_none(const Api& api)
         store(static_cast<unsigned char*>(next), 0, 7, 0x9999);
     }
     unsigned char connect_input[0x18]{}, connect_output[0x10]{};
+    set_buffer_size(connect_input);
     u64 handle = 0;
     check(api.connect(connect_input, connect_output, &handle) == 0, "XApuConnect");
     check(api.disconnect(handle) == 0, "XApuDisconnect");
@@ -363,6 +372,7 @@ void script_unload(const Api& api, HMODULE acphal, HMODULE xapu)
     expect("re-run without ApuFree", take(api.acphal_activity), TRUE, acphal_fields,
            {{watched, 4}, {live, 1}, {filled, 2}, {submits, 1}, {submit_type0 + 1, 1}});
     unsigned char connect_input[0x18]{}, connect_output[0x10]{}, command[0x60]{};
+    set_buffer_size(connect_input);
     u64 handle = 0;
     command[0] = 1;
     check(api.connect(connect_input, connect_output, &handle) == 0, "XApuConnect");
