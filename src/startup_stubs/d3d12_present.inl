@@ -26,10 +26,11 @@ LONG window_presents;
 
 // The output window belongs to this layer and has its own thread and message loop; the title's
 // window is left alone (a swap chain on it made the title stop at one of its own fatal checks).
-// With X2W_HIDE_TITLE_WINDOW=1, a timer on this thread hides the title's own window once a frame
-// has been shown here, and again whenever the title shows it (docs/startup-runtime.md#switches).
+// With X2W_HIDE_TITLE_WINDOW=1, a timer on this thread hides the title's own window while frames
+// are shown here (x2w_startup::TitleWindowHider, docs/startup-runtime.md#switches).
 HWND output_handle;
-constexpr UINT_PTR hide_title_timer = 1;
+LONG last_frame_shown;  // whether the latest present reached this window (set by queue_present)
+x2w_startup::TitleWindowHider title_hider;  // used on the output window's thread only
 DWORD WINAPI output_window_thread(void* ready)
 {
     WNDCLASSW cls{};
@@ -38,12 +39,22 @@ DWORD WINAPI output_window_thread(void* ready)
             ShowWindow(window, SW_MINIMIZE);
             return 0;
         }
-        if (message == WM_TIMER && w == hide_title_timer) {
-            if (InterlockedCompareExchange(&window_presents, 0, 0) > 0) {
-                // Keyboard input reaches the title only while a window of this process is in front.
-                bool had_foreground = false;
-                if (x2w_startup::hide_title_windows(&had_foreground) && had_foreground)
-                    SetForegroundWindow(window);
+        if (message == WM_TIMER && w == x2w_startup::hide_title_timer) {
+            bool refused = false;
+            const int changed = title_hider.step(window, InterlockedCompareExchange(&window_presents, 0, 0),
+                                                 InterlockedCompareExchange(&last_frame_shown, 0, 0), &refused);
+            static bool told_refused, told_hidden, told_shown;
+            if (refused && !told_refused) {
+                told_refused = true;  // keyboard input reaches the title only while this process is in front
+                log("x2w-present the output window could not take the foreground from the title's window");
+            }
+            if (changed > 0 && !told_hidden) {
+                told_hidden = true;
+                log("x2w-present X2W_HIDE_TITLE_WINDOW: hid %d title window(s)", changed);
+            }
+            if (changed < 0 && !told_shown) {
+                told_shown = true;
+                log("x2w-present X2W_HIDE_TITLE_WINDOW: frames no longer shown, %d title window(s) shown again", -changed);
             }
             return 0;
         }
@@ -60,8 +71,7 @@ DWORD WINAPI output_window_thread(void* ready)
     output_handle = CreateWindowExW(0, cls.lpszClassName, title, WS_OVERLAPPEDWINDOW, 60, 60,
                                     area.right - area.left, area.bottom - area.top, nullptr, nullptr, cls.hInstance, nullptr);
     if (output_handle) ShowWindow(output_handle, SW_SHOWNOACTIVATE);
-    if (output_handle && x2w_startup::hide_title_window_requested())
-        SetTimer(output_handle, hide_title_timer, 500, nullptr);
+    if (output_handle) x2w_startup::TitleWindowHider::start(output_handle);
     SetEvent(static_cast<HANDLE>(ready));
     MSG message;
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
