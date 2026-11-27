@@ -107,3 +107,7 @@ The check builds a synthetic PE32+ at run time with `build_pe32_plus` from
 
 Measured on 27.11.2026 on Windows 11 Pro with Python 3.14: 3 tests, all passed. The `python-linux`
 CI job ran the first version of the check with Python 3.12 and passed.
+
+With the nesting, shader and `load_data` cases: 8 tests, all passed on Linux (Debian 13) with Python
+3.13.5 and pefile 2024.8.26. Each mutation in the table above made the check fail, and the revision-bump
+control stayed green. Not yet run on Windows.
