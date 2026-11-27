@@ -83,6 +83,7 @@ The check builds a synthetic PE32+ at run time with `build_pe32_plus` from
 - **Wrong-type `kind` through the CLI:** exit status 1 with a `patch manifest:` message, and no traceback.
 - **Bytes already read:** `load_data` on the image's bytes returns what `load` returns; on the flipped image it is refused as `for another input`. With the input file then replaced by the flipped image, `load_data` on the original bytes still loads and `load` on the file is refused.
 - **Shader patches:** one per pipeline loads beside a memory patch, mesh86 with and without its `.ps.cso`, and the CLI lists their ids. Each of these is refused with its own message: a 15-digit key, an upper-case key, an unknown pipeline, another pipeline's revision (compute, graphics and the mesh57 cache's), a revision without its number, one with a leading zero, an integer revision, an empty `files`, an unknown or a missing file key, another pipeline's extension, an extension listed twice, a missing required file (compute and graphics), an empty `file`, a `file` with a `/` or a `\`, an absolute one, one with a drive, `..` and `.`, an upper-case `sha256`, two patches for one key, a memory key on a shader patch, a missing `files`, and kind `shaders`.
+- **Files pinned:** each pipeline's extensions are the ones its loader in the runtime reads for a key (`cache_path(..., L"", key, ext)` in `d3d12_draw.inl`, `d3d12_compute_dispatch.inl` and `mesh86_cache.inl`, and mesh86's `load_stage`), and mesh86's `.ps.cso` is the only optional one, read only for a request with a pixel shader.
 - **Revision forms pinned:** the runtime's current revision of each pipeline, read from its source, has the loader's form. A bump that only raises `<n>` keeps the check green. The fixture uses revisions of each form that are not the runtime's current ones.
 - **Deep nesting:** an array nested 2000 deep is refused as `nested too deeply`, by `parse` and through the CLI (status 1, nothing on stdout, no traceback). Shape control: one nested 50 deep gets past `tomllib` and is refused only for its unknown key.
 - **Mutations:**
@@ -97,6 +98,7 @@ The check builds a synthetic PE32+ at run time with `build_pe32_plus` from
   | `load_data` compares the target with itself | The flipped image is accepted by `load_data`. |
   | Revision form check removed | The other-pipeline and malformed revision cases are accepted. |
   | Bare-name check on `file` removed | The six non-bare `file` cases are accepted. |
+  | The runtime reads `.vx.cso` instead of `.vs.cso` (`d3d12_draw.inl`) | The files pin fails for graphics. |
   | Required-file check removed | Both missing-file cases are accepted. |
   | Same-key check removed | The two-patches-for-one-key case is accepted. |
   | `RecursionError` no longer caught | The deep-nesting case raises `RecursionError`, and the CLI prints a traceback. |

@@ -223,6 +223,21 @@ class PatchManifest(unittest.TestCase):
                 self.assertEqual(len(revisions), 1, revisions)
                 self.assertTrue(patch_manifest.REVISIONS[pipeline].fullmatch(revisions[0]), revisions[0])
 
+    def test_shader_files_match_the_runtime(self):
+        # The translation files each pipeline's loader in the runtime reads for one key: cache_path(..., L"", key, ext)
+        # and mesh86's load_stage(ext, ...). mesh86 reads its .ps.cso only for a request with a pixel shader.
+        reads = re.compile(r'(?:cache_path\(\w+, L"", [\w.]+, |load_stage\()L"(\.[a-z0-9.]+)"')
+        sources = {"graphics": "d3d12_draw.inl", "compute": "d3d12_compute_dispatch.inl", "mesh86": "mesh86_cache.inl"}
+        self.assertEqual(set(sources), set(patch_manifest.PIPELINES))
+        for pipeline, name in sources.items():
+            text = (ROOT / "src/startup_stubs" / name).read_text(encoding="utf-8")
+            with self.subTest(pipeline):
+                self.assertEqual(set(reads.findall(text)), set(patch_manifest.PIPELINES[pipeline][1]))
+        mesh86 = (ROOT / "src/startup_stubs/mesh86_cache.inl").read_text(encoding="utf-8")
+        self.assertIn('(!request.ps.empty() && !load_stage(L".ps.cso", ps))', mesh86)
+        self.assertEqual(set(patch_manifest.PIPELINES["mesh86"][1]) - set(patch_manifest.PIPELINES["mesh86"][2]),
+                         {".ps.cso"})
+
     def test_deep_nesting_is_refused(self):
         def nested(depth):
             return "x = " + "[" * depth + "]" * depth + "\n" + manifest_text(self.digest, self.original)
