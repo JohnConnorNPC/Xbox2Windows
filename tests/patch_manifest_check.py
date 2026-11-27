@@ -40,6 +40,20 @@ bytes = "{REPLACEMENT}"
     return f'[target]\ninput_sha256 = "{input_sha256}"\n{patches}'
 
 
+def memory_patch(pid, rva, replacement=REPLACEMENT):
+    """One [[patch]] of kind memory; parse checks the shape of expect_sha256, not the bytes it hashes."""
+    return f"""
+[[patch]]
+id = "{pid}"
+kind = "memory"
+why = "synthetic fixture"
+remove_when = "never; this is a test"
+rva = {rva:#x}
+expect_sha256 = "{hashlib.sha256(pid.encode()).hexdigest()}"
+bytes = "{replacement}"
+"""
+
+
 def shader_patch(pid="s001", key="00c0ffee0badf00d", pipeline="compute", revision=None, exts=None):
     """One [[patch]] of kind shader; its files are named after the patch and hashed from their names."""
     revision = revision or REVISION[pipeline]
@@ -83,7 +97,10 @@ class PatchManifest(unittest.TestCase):
         self.assertEqual(plan["manifest_sha256"], hashlib.sha256(self.manifest.read_bytes()).hexdigest())
         self.assertEqual(plan["input_sha256"], self.digest)
         [patch] = plan["patches"]
-        self.assertEqual((patch["id"], patch["rva"], patch["bytes"]), ("p001", SECTION_RVA, bytes.fromhex(REPLACEMENT)))
+        self.assertEqual(patch, {"id": "p001", "kind": "memory", "why": "synthetic fixture",
+                                 "remove_when": "never; this is a test", "rva": SECTION_RVA,
+                                 "expect_sha256": hashlib.sha256(self.original).hexdigest(),
+                                 "bytes": bytes.fromhex(REPLACEMENT)})
         result = self.cli(self.input)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"p001"', result.stdout)
@@ -93,6 +110,29 @@ class PatchManifest(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("manifest is for another input", result.stderr)
         self.assertEqual(result.stdout, "")
+        # An input that cannot be opened is a diagnostic too, not a traceback.
+        result = self.cli(self.input.with_name("absent.bin"))
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("patch manifest: [Errno", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_memory_patches_side_by_side(self):
+        # Adjacent spans do not overlap, the order of the [[patch]] tables does not matter, and RVA 0 is in range.
+        text = manifest_text(self.digest, self.original, patches="".join(
+            memory_patch(pid, rva) for pid, rva in (("p003", SECTION_RVA + 4), ("p002", SECTION_RVA + 2),
+                                                    ("p001", SECTION_RVA), ("p000", 0))))
+        _, patches = patch_manifest.parse(text)
+        self.assertEqual([(p["id"], p["rva"]) for p in patches],
+                         [("p003", SECTION_RVA + 4), ("p002", SECTION_RVA + 2), ("p001", SECTION_RVA), ("p000", 0)])
+        # One shared byte is an overlap, in either order.
+        for first, second in ((SECTION_RVA, SECTION_RVA + 1), (SECTION_RVA + 1, SECTION_RVA)):
+            with self.subTest(first=first, second=second):
+                text = manifest_text(self.digest, self.original,
+                                     patches=memory_patch("p001", first) + memory_patch("p002", second))
+                with self.assertRaises(ValueError) as caught:
+                    patch_manifest.parse(text)
+                self.assertRegex(str(caught.exception), r"patches p00[12] and p00[12] overlap")
 
     def test_malformed_manifests_are_refused(self):
         sha = self.digest
@@ -109,8 +149,13 @@ class PatchManifest(unittest.TestCase):
             "duplicate patch id: p001": ok + ok.split("[target]", 1)[1].split("\n", 2)[2],
             "patches p001 and p002 overlap": ok + second,
             "bytes must be": ok.replace(REPLACEMENT, "90c"),
+            "p001 bytes must be a non-empty": ok.replace(f'bytes = "{REPLACEMENT}"', 'bytes = ""'),
             "rva must be": ok.replace(f"rva = {SECTION_RVA:#x}", "rva = true"),
             "input_sha256 must be": ok.replace(sha, sha.upper()),
+            # A hash or key with trailing text is malformed, not a hash of another input.
+            "input_sha256 must be 64 lowercase hex digits": ok.replace(sha, sha + "0"),
+            "p001 expect_sha256 must be 64": ok.replace(hashlib.sha256(self.original).hexdigest(),
+                                                       hashlib.sha256(self.original).hexdigest() + "x"),
             "at least one [[patch]]": "patch = []\n" + manifest_text(sha, self.original, patches=""),
         }
         for message, text in cases.items():
@@ -169,6 +214,7 @@ class PatchManifest(unittest.TestCase):
         cases = {
             "key must be 16 lowercase hex digits": ok + shader_patch(key="00c0ffee0badf00"),
             "s001 key must be 16 lowercase hex": ok + shader_patch(key="00C0FFEE0BADF00D"),
+            "patch s001 key must be 16 lowercase hex digits": ok + shader_patch(key="00c0ffee0badf00d0"),
             "pipeline must be one of: graphics, compute, mesh86": ok + shader_patch().replace('"compute"', '"vertex"'),
             "revision 'x2w-startup-shader-12' is not a compute key revision (x2w-startup-shader-<n>cs)":
                 ok + shader_patch(revision="x2w-startup-shader-12"),
