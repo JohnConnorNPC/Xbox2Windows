@@ -96,12 +96,14 @@ The check builds a synthetic PE32+ at run time with `build_pe32_plus` from
   | Span check removed | The 2-byte patch at `0xffffffff` is accepted. |
   | Span check off by one (`>=`) | The 1-byte case at `0xffffffff` is refused. |
   | `load_data` compares the target with itself | The flipped image is accepted by `load_data`. |
-  | Revision form check removed | The other-pipeline and malformed revision cases are accepted. |
+  | Revision form check removed | The other-pipeline, number-less and leading-zero revision cases are accepted. |
+  | The runtime's graphics revision gets a suffix (`x2w-startup-shader-29b`) | The revision-form pin fails for graphics. |
+  | The runtime's graphics revision is bumped (`-29` to `-30`), loader untouched | Control: the check stays green. |
   | Bare-name check on `file` removed | The six non-bare `file` cases are accepted. |
   | The runtime reads `.vx.cso` instead of `.vs.cso` (`d3d12_draw.inl`) | The files pin fails for graphics. |
   | Required-file check removed | Both missing-file cases are accepted. |
   | Same-key check removed | The two-patches-for-one-key case is accepted. |
-  | `RecursionError` no longer caught | The deep-nesting case raises `RecursionError`, and the CLI prints a traceback. |
+  | `RecursionError` no longer caught | The deep-nesting case raises `RecursionError`. |
 
 Measured on 27.11.2026 on Windows 11 Pro with Python 3.14: 3 tests, all passed. The `python-linux`
 CI job ran the first version of the check with Python 3.12 and passed.
