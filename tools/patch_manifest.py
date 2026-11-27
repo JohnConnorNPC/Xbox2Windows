@@ -14,9 +14,20 @@ A manifest is TOML:
     expect_sha256 = "<sha256 of the len(bytes) original bytes at rva>"
     bytes = "90c3"               # the replacement, lowercase hex
 
+    [[patch]]
+    id = "s001"
+    kind = "shader"              # the translation files of one shader cache key
+    why = "<issue or root cause>"
+    remove_when = "<condition>"
+    key = "0123456789abcdef"     # the cache key, 16 lowercase hex digits
+    pipeline = "compute"         # graphics, compute or mesh86
+    revision = "x2w-startup-shader-29cs"
+    files = [{ ext = ".txt", file = "s001.txt", sha256 = "<sha256>" },
+             { ext = ".cs.cso", file = "s001.cs.cso", sha256 = "<sha256>" }]
+
 The whole manifest is validated and the input's SHA-256 compared before anything is returned, so
-a manifest that fails any check applies nothing. Only the memory kind is defined so far, and
-nothing applies it yet.
+a manifest that fails any check applies nothing. The memory and shader kinds are defined, checked
+for shape only; nothing applies them yet.
 """
 
 import argparse
@@ -28,9 +39,17 @@ import tomllib
 
 SHA256 = re.compile(r"[0-9a-f]{64}")
 HEX = re.compile(r"(?:[0-9a-f]{2})+")
+KEY = re.compile(r"[0-9a-f]{16}")
 COMMON = {"id", "kind", "why", "remove_when"}
 # Every key of a kind is required. hook and data get their tables with their stages.
-KINDS = {"memory": {"rva", "expect_sha256", "bytes"}}
+KINDS = {"memory": {"rva", "expect_sha256", "bytes"}, "shader": {"key", "pipeline", "revision", "files"}}
+# Shader patches, per pipeline: the runtime's key revision (src/startup_stubs/d3d12_draw.inl and mesh86_cache.inl),
+# the translation files it reads for one key, and the ones without which it has no translation.
+PIPELINES = {
+    "graphics": ("x2w-startup-shader-29", (".txt", ".vs.cso", ".ps.cso"), (".txt", ".vs.cso", ".ps.cso")),
+    "compute": ("x2w-startup-shader-29cs", (".txt", ".cs.cso"), (".txt", ".cs.cso")),
+    "mesh86": ("x2w-startup-mesh-86-1", (".mesh86.txt", ".ms.cso", ".ps.cso"), (".mesh86.txt", ".ms.cso")),
+}
 
 
 def _keys(table, keys, where):
@@ -52,6 +71,35 @@ def _sha256(value, where):
     if not isinstance(value, str) or not SHA256.fullmatch(value):
         raise ValueError(f"{where} must be 64 lowercase hex digits")
     return value
+
+
+def _shader(entry, where):
+    """The key, pipeline, revision and files of a shader patch, checked for shape only."""
+    key = entry["key"]
+    if not isinstance(key, str) or not KEY.fullmatch(key):
+        raise ValueError(f"{where} key must be 16 lowercase hex digits")
+    pipeline = entry["pipeline"]
+    if not isinstance(pipeline, str) or pipeline not in PIPELINES:
+        raise ValueError(f"{where} pipeline must be one of: {', '.join(PIPELINES)}")
+    revision, extensions, required = PIPELINES[pipeline]
+    if entry["revision"] != revision:
+        raise ValueError(f"{where} revision {entry['revision']!r} is not the runtime's {pipeline} key revision {revision}")
+    if not isinstance(entry["files"], list) or not entry["files"]:
+        raise ValueError(f"{where} files must be a non-empty array of tables")
+    files = {}
+    for index, item in enumerate(entry["files"]):
+        at = f"{where} files[{index}]"
+        _keys(item, {"ext", "file", "sha256"}, at)
+        ext = item["ext"]
+        if not isinstance(ext, str) or ext not in extensions:
+            raise ValueError(f"{at} ext {ext!r} is not a {pipeline} translation file ({', '.join(extensions)})")
+        if ext in files:
+            raise ValueError(f"{where} lists {ext} twice")
+        files[ext] = {"ext": ext, "file": _text(item["file"], f"{at} file"),
+                      "sha256": _sha256(item["sha256"], f"{at} sha256")}
+    if missing := [ext for ext in required if ext not in files]:
+        raise ValueError(f"{where} {pipeline} override is missing: {', '.join(missing)}")
+    return {"key": key, "pipeline": pipeline, "revision": revision, "files": list(files.values())}
 
 
 def parse(text):
@@ -76,6 +124,13 @@ def parse(text):
         if any(p["id"] == pid for p in patches):
             raise ValueError(f"duplicate patch id: {pid}")
         where = f"patch {pid}"
+        if kind == "shader":
+            patch = {"id": pid, "kind": kind, "why": _text(entry["why"], f"{where} why"),
+                     "remove_when": _text(entry["remove_when"], f"{where} remove_when"), **_shader(entry, where)}
+            if other := next((p["id"] for p in patches if p.get("key") == patch["key"]), None):
+                raise ValueError(f"patches {other} and {pid} override the same key {patch['key']}")
+            patches.append(patch)
+            continue
         rva = entry["rva"]
         if type(rva) is not int or not 0 <= rva < 1 << 32:
             raise ValueError(f"{where} rva must be an integer in [0, 2^32)")
