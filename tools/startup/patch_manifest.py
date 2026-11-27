@@ -2,19 +2,17 @@
 
 usage: patch_manifest.py check <manifest.toml> <input>
 
-A patch manifest is a TOML file bound to one input file by SHA-256. It lists `memory` patches
-(bytes at an RVA of the loaded image) and `data` patches (a byte range of a data file). This module
-only reads and checks manifests; nothing here applies a patch.
+A patch manifest is a TOML file bound to one input file by SHA-256. It lists `memory` patches:
+replacement bytes at an RVA of the loaded image. This module only reads and checks manifests;
+nothing here applies a patch. Kinds of later stages (`hook`, stage 1; `data`, stage 3) are refused.
 
-`check` prints `patches: ok manifest sha256=<hex> patches=<n> (memory=<n> data=<n>)` and exits 0,
-or prints `patches: refused: <reason>` and exits 3. Usage errors exit 2. A manifest is accepted
-whole or refused whole: one bad patch refuses all of them.
+`check` prints `patches: ok manifest sha256=<hex> patches=<n>` and exits 0, or prints
+`patches: refused: <reason>` and exits 3. Usage errors exit 2. A manifest is accepted whole or
+refused whole: one bad patch refuses all of them.
 
-Hashes are 64 hex digits in either case; they are compared in lowercase. tomllib (Python 3.11+)
-is imported only when a manifest is loaded, so importing this module works on older versions.
+Hashes are 64 hex digits in either case; they are stored and compared in lowercase. tomllib is
+imported only when a manifest is loaded.
 """
-from __future__ import annotations
-
 import dataclasses
 import hashlib
 import os
@@ -25,15 +23,13 @@ SHA256_RE = re.compile(r"[0-9a-fA-F]{64}\Z")
 ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 HEX_BYTES_RE = re.compile(r"(?:[0-9a-fA-F]{2})+\Z")
 HEX_NUMBER_RE = re.compile(r"0x[0-9a-fA-F]{1,16}\Z")
-# The longest replacement written as `bytes`; a longer data replacement uses `file`.
-MAX_INLINE_BYTES = 4096
+# The longest replacement of one memory patch.
+MAX_BYTES = 4096
 
 TOP_KEYS = {"target", "patch"}
 TARGET_KEYS = {"input_sha256"}
-COMMON_KEYS = {"id", "kind", "why", "remove_when"}
-MEMORY_KEYS = {"rva", "expect_sha256", "bytes"}
-DATA_REQUIRED = {"path", "expect_size", "offset", "expect_sha256"}
-DATA_OPTIONAL = {"bytes", "file", "replacement_sha256"}
+PATCH_KEYS = {"id", "kind", "why", "remove_when", "rva", "expect_sha256", "bytes"}
+NOT_IMPLEMENTED = {"hook": "stage 1", "data": "stage 3"}
 
 
 class PatchError(Exception):
@@ -43,17 +39,12 @@ class PatchError(Exception):
 @dataclasses.dataclass(frozen=True)
 class Patch:
     id: str
-    kind: str  # "memory" or "data"
+    kind: str  # "memory"
     why: str
     remove_when: str
-    expect_sha256: str  # lowercase hash of the original bytes the patch replaces
-    rva: int | None = None  # memory
-    path: str | None = None  # data: relative to the data directory, "/" separators
-    expect_size: int | None = None  # data: size of the original file
-    offset: int | None = None  # data: first replaced byte in the original file
-    data: bytes | None = None  # replacement written inline as `bytes`
-    file: str | None = None  # data: replacement file, relative to the manifest's directory
-    replacement_sha256: str | None = None  # data: lowercase hash of `file`
+    rva: int
+    expect_sha256: str  # lowercase hash of the len(data) original bytes at rva
+    data: bytes  # the replacement, written as `bytes`
 
 
 @dataclasses.dataclass(frozen=True)
@@ -62,9 +53,6 @@ class Manifest:
     sha256: str  # of the manifest file's bytes
     input_sha256: str  # lowercase
     patches: tuple
-
-    def count(self, kind):
-        return sum(p.kind == kind for p in self.patches)
 
 
 def sha256_file(path):
@@ -87,13 +75,13 @@ def _text(where, value):
     return value
 
 
-def _number(where, value, bits):
-    """A TOML integer or a "0x..." string, from 0 up to 2**bits - 1."""
+def _rva(where, value):
+    """A TOML integer or a "0x..." string, below 2**32."""
     if isinstance(value, str) and HEX_NUMBER_RE.match(value):
         value = int(value, 16)
     elif isinstance(value, bool) or not isinstance(value, int):
         raise PatchError(f"{where}: expected an integer or a \"0x...\" hex string")
-    if not 0 <= value < 1 << bits:
+    if not 0 <= value < 1 << 32:
         raise PatchError(f"{where}: out of range")
     return value
 
@@ -102,19 +90,9 @@ def _hex_bytes(where, value):
     if not isinstance(value, str) or not HEX_BYTES_RE.match(value):
         raise PatchError(f"{where}: expected an even number of hex digits")
     data = bytes.fromhex(value)
-    if len(data) > MAX_INLINE_BYTES:
-        raise PatchError(f"{where}: {len(data)} bytes, more than {MAX_INLINE_BYTES}")
+    if len(data) > MAX_BYTES:
+        raise PatchError(f"{where}: {len(data)} bytes, more than {MAX_BYTES}")
     return data
-
-
-def _relative_path(where, value):
-    """A relative path with "/" separators that cannot leave its base directory."""
-    if not isinstance(value, str) or not value:
-        raise PatchError(f"{where}: expected a relative path")
-    parts = value.split("/")
-    if "\\" in value or ":" in value or "\0" in value or any(p in ("", ".", "..") for p in parts):
-        raise PatchError(f"{where}: expected a relative path with \"/\" separators and no \".\" or \"..\" parts")
-    return value
 
 
 def _patch(index, entry):
@@ -126,41 +104,21 @@ def _patch(index, entry):
         raise PatchError(f"{where}: id must match [a-z0-9][a-z0-9._-]{{0,63}}")
     where = f"patch {raw_id}"
     kind = entry.get("kind")
-    if kind == "hook":
-        raise PatchError(f"{where}: kind \"hook\" (stage 1) is not implemented")
-    if kind == "memory":
-        required, optional = MEMORY_KEYS, set()
-    elif kind == "data":
-        required, optional = DATA_REQUIRED, DATA_OPTIONAL
-    else:
-        raise PatchError(f"{where}: kind must be \"memory\" or \"data\"")
-    unknown = set(entry) - COMMON_KEYS - required - optional
+    if kind in NOT_IMPLEMENTED:
+        raise PatchError(f"{where}: kind \"{kind}\" ({NOT_IMPLEMENTED[kind]}) is not implemented")
+    if kind != "memory":
+        raise PatchError(f"{where}: kind must be \"memory\"")
+    unknown = set(entry) - PATCH_KEYS
     if unknown:
-        raise PatchError(f"{where}: unknown key(s) for kind {kind}: {', '.join(sorted(unknown))}")
-    missing = (COMMON_KEYS | required) - set(entry)
+        raise PatchError(f"{where}: unknown key(s): {', '.join(sorted(unknown))}")
+    missing = PATCH_KEYS - set(entry)
     if missing:
         raise PatchError(f"{where}: missing {', '.join(sorted(missing))}")
-    common = dict(id=raw_id, kind=kind, why=_text(f"{where} why", entry["why"]),
-                  remove_when=_text(f"{where} remove_when", entry["remove_when"]),
-                  expect_sha256=_sha256(f"{where} expect_sha256", entry["expect_sha256"]))
-    if kind == "memory":
-        return Patch(**common, rva=_number(f"{where} rva", entry["rva"], 32),
-                     data=_hex_bytes(f"{where} bytes", entry["bytes"]))
-    if ("bytes" in entry) == ("file" in entry):
-        raise PatchError(f"{where}: needs exactly one of bytes or file")
-    if ("file" in entry) != ("replacement_sha256" in entry):
-        raise PatchError(f"{where}: file and replacement_sha256 go together")
-    size = _number(f"{where} expect_size", entry["expect_size"], 63)
-    offset = _number(f"{where} offset", entry["offset"], 63)
-    patch = Patch(**common, path=_relative_path(f"{where} path", entry["path"]), expect_size=size, offset=offset)
-    if "bytes" in entry:
-        data = _hex_bytes(f"{where} bytes", entry["bytes"])
-        if offset + len(data) > size:
-            raise PatchError(f"{where}: offset + length of bytes is past expect_size")
-        return dataclasses.replace(patch, data=data)
-    return dataclasses.replace(patch, file=_relative_path(f"{where} file", entry["file"]),
-                               replacement_sha256=_sha256(f"{where} replacement_sha256",
-                                                          entry["replacement_sha256"]))
+    return Patch(id=raw_id, kind=kind, why=_text(f"{where} why", entry["why"]),
+                 remove_when=_text(f"{where} remove_when", entry["remove_when"]),
+                 rva=_rva(f"{where} rva", entry["rva"]),
+                 expect_sha256=_sha256(f"{where} expect_sha256", entry["expect_sha256"]),
+                 data=_hex_bytes(f"{where} bytes", entry["bytes"]))
 
 
 def load(path):
@@ -229,8 +187,7 @@ def main(argv):
     except PatchError as error:
         print(f"patches: refused: {error}")
         return 3
-    print(f"patches: ok manifest sha256={manifest.sha256} patches={len(manifest.patches)} "
-          f"(memory={manifest.count('memory')} data={manifest.count('data')})")
+    print(f"patches: ok manifest sha256={manifest.sha256} patches={len(manifest.patches)}")
     return 0
 
 
