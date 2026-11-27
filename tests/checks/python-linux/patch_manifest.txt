@@ -1,0 +1,2 @@
+# Patch manifest schema, loader and input hash gate (#3037; docs/experiments/patch-manifests.md).
+tests/patch_manifest_check.py
