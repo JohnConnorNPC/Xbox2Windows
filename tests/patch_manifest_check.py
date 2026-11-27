@@ -127,6 +127,18 @@ class PatchManifest(unittest.TestCase):
         self.assertIn("patch manifest: [[patch]] 0: kind ['memory'] is not supported", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_load_data_gates_the_bytes_given(self):
+        image, other = self.input.read_bytes(), self.other.read_bytes()
+        self.assertEqual(patch_manifest.load_data(self.manifest, image), patch_manifest.load(self.manifest, self.input))
+        with self.assertRaises(ValueError) as caught:
+            patch_manifest.load_data(self.manifest, other)
+        self.assertIn("manifest is for another input", str(caught.exception))
+        # The bytes in hand decide, not the file they came from: the input file now holds the other image.
+        self.input.write_bytes(other)
+        self.assertEqual(patch_manifest.load_data(self.manifest, bytearray(image))["input_sha256"], self.digest)
+        with self.assertRaises(ValueError):
+            patch_manifest.load(self.manifest, self.input)
+
     def test_shader_patches(self):
         sha = self.digest
         ok = manifest_text(sha, self.original)

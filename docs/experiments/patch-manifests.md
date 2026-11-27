@@ -22,6 +22,7 @@ bytes = "90c3"                    # the replacement, lowercase hex
 ```
 
 - **Hash gate:** the manifest applies only to the file whose SHA-256 equals `input_sha256`. Any other input is refused with `manifest is for another input`.
+- **Bytes already read:** `load_data(manifest, data)` is `load` for a caller that has already read the input: it hashes `data`, so the bytes that pass the gate are the bytes the caller goes on to use, even if the file changes in between.
 - **No partial apply:** the whole manifest is validated, and the input hash compared, before the loader returns anything. One bad patch refuses the manifest.
 - **Every patch** needs a unique `id`, a `kind`, and non-empty `why` and `remove_when`.
 - **Strict keys:** unknown keys and missing keys are refused at every level, so a misspelled key fails instead of being ignored.
@@ -80,6 +81,7 @@ The check builds a synthetic PE32+ at run time with `build_pe32_plus` from
 - **Malformed manifests:** each of these is refused with its own message: a misspelled key, kind `hook`, a list or inline-table `kind`, a missing `why`, a blank `remove_when`, a duplicate id, overlapping patches, odd-length `bytes`, a boolean `rva`, a 2-byte patch at `0xffffffff`, an upper-case `input_sha256`, no patches, and a TOML syntax error.
 - **Edge of the RVA range:** a 1-byte patch at `0xffffffff` loads.
 - **Wrong-type `kind` through the CLI:** exit status 1 with a `patch manifest:` message, and no traceback.
+- **Bytes already read:** `load_data` on the image's bytes returns what `load` returns; on the flipped image it is refused as `for another input`. With the input file then replaced by the flipped image, `load_data` on the original bytes still loads and `load` on the file is refused.
 - **Shader patches:** one per pipeline loads beside a memory patch, mesh86 with and without its `.ps.cso`, and the CLI lists their ids. Each of these is refused with its own message: a 15-digit key, an upper-case key, an unknown pipeline, another pipeline's revision, an empty `files`, an unknown or a missing file key, another pipeline's extension, an extension listed twice, a missing required file (compute and graphics), an empty `file`, an upper-case `sha256`, two patches for one key, a memory key on a shader patch, a missing `files`, and kind `shaders`.
 - **Revisions pinned:** each pipeline's `revision` is found as written in the runtime source and in the translator that writes the cache (`tools/startup/gfx2hlsl.py`, `tools/startup/mesh86_cache.py`).
 - **Deep nesting:** an array nested 2000 deep is refused as `nested too deeply`, by `parse` and through the CLI (status 1, nothing on stdout, no traceback). Shape control: one nested 50 deep gets past `tomllib` and is refused only for its unknown key.
@@ -92,6 +94,7 @@ The check builds a synthetic PE32+ at run time with `build_pe32_plus` from
   | String check on `kind` removed | Both wrong-type cases raise `TypeError`, and the CLI prints a traceback. |
   | Span check removed | The 2-byte patch at `0xffffffff` is accepted. |
   | Span check off by one (`>=`) | The 1-byte case at `0xffffffff` is refused. |
+  | `load_data` compares the target with itself | The flipped image is accepted by `load_data`. |
   | Shader revision comparison removed | The wrong-revision case is accepted. |
   | Required-file check removed | Both missing-file cases are accepted. |
   | Same-key check removed | The two-patches-for-one-key case is accepted. |

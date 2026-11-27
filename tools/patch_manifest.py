@@ -163,6 +163,18 @@ def load(manifest_path, input_path):
     target, patches = parse(raw.decode("utf-8"))
     with open(input_path, "rb") as handle:
         digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    return _bound(raw, target, patches, digest)
+
+
+def load_data(manifest_path, data):
+    """load() for an input the caller has already read: data is hashed, so the bytes that pass the gate are
+    the bytes the caller goes on to use, even if the file on disk changes in between."""
+    raw = Path(manifest_path).read_bytes()
+    target, patches = parse(raw.decode("utf-8"))
+    return _bound(raw, target, patches, hashlib.sha256(data).hexdigest())
+
+
+def _bound(raw, target, patches, digest):
     if digest != target:
         raise ValueError(f"manifest is for another input: manifest input_sha256 {target}, input sha256 {digest}")
     return {"manifest_sha256": hashlib.sha256(raw).hexdigest(), "input_sha256": digest, "patches": patches}
