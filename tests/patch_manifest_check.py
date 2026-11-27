@@ -3,6 +3,7 @@
 import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,9 @@ import patch_manifest  # noqa: E402
 from call_evidence_check import SECTION_RVA, build_pe32_plus  # noqa: E402
 
 REPLACEMENT = "90c3"
+# Revisions of each pipeline's form, not the runtime's current ones: the loader checks the form only.
+REVISION = {"graphics": "x2w-startup-shader-12", "compute": "x2w-startup-shader-12cs",
+            "mesh86": "x2w-startup-mesh-86-4"}
 
 
 def manifest_text(input_sha256, original, patches=None):
@@ -38,10 +42,10 @@ bytes = "{REPLACEMENT}"
 
 def shader_patch(pid="s001", key="00c0ffee0badf00d", pipeline="compute", revision=None, exts=None):
     """One [[patch]] of kind shader; its files are named after the patch and hashed from their names."""
-    revision = revision or patch_manifest.PIPELINES[pipeline][0]
+    revision = revision or REVISION[pipeline]
     exts = patch_manifest.PIPELINES[pipeline][2] if exts is None else exts
-    files = ", ".join(f'{{ ext = "{ext}", file = "{pid}{ext}", sha256 = "{hashlib.sha256((pid + ext).encode()).hexdigest()}" }}'
-                      for ext in exts)
+    files = ", ".join(f'{{ ext = "{ext}", file = "{pid}{ext}", '
+                      f'sha256 = "{hashlib.sha256((pid + ext).encode()).hexdigest()}" }}' for ext in exts)
     return f"""
 [[patch]]
 id = "{pid}"
@@ -147,11 +151,11 @@ class PatchManifest(unittest.TestCase):
                 + shader_patch("s003", "fedcba9876543210", "mesh86")
                 + shader_patch("s004", "0000000000000001", "mesh86", exts=(".mesh86.txt", ".ms.cso", ".ps.cso")))
         target, patches = patch_manifest.parse(text)
-        self.assertEqual([(p["id"], p["kind"]) for p in patches],
-                         [("p001", "memory"), ("s001", "shader"), ("s002", "shader"), ("s003", "shader"), ("s004", "shader")])
+        self.assertEqual([(p["id"], p["kind"]) for p in patches], [("p001", "memory")] + [
+            (pid, "shader") for pid in ("s001", "s002", "s003", "s004")])
         s001 = patches[1]
         self.assertEqual((s001["key"], s001["pipeline"], s001["revision"]),
-                         ("00c0ffee0badf00d", "compute", "x2w-startup-shader-29cs"))
+                         ("00c0ffee0badf00d", "compute", "x2w-startup-shader-12cs"))
         self.assertEqual(s001["files"], [
             {"ext": ".txt", "file": "s001.txt", "sha256": hashlib.sha256(b"s001.txt").hexdigest()},
             {"ext": ".cs.cso", "file": "s001.cs.cso", "sha256": hashlib.sha256(b"s001.cs.cso").hexdigest()}])
@@ -166,8 +170,16 @@ class PatchManifest(unittest.TestCase):
             "key must be 16 lowercase hex digits": ok + shader_patch(key="00c0ffee0badf00"),
             "s001 key must be 16 lowercase hex": ok + shader_patch(key="00C0FFEE0BADF00D"),
             "pipeline must be one of: graphics, compute, mesh86": ok + shader_patch().replace('"compute"', '"vertex"'),
-            "revision 'x2w-startup-shader-29' is not the runtime's compute key revision x2w-startup-shader-29cs":
-                ok + shader_patch(revision="x2w-startup-shader-29"),
+            "revision 'x2w-startup-shader-12' is not a compute key revision (x2w-startup-shader-<n>cs)":
+                ok + shader_patch(revision="x2w-startup-shader-12"),
+            "s002 revision 'x2w-startup-shader-12cs' is not a graphics key revision (x2w-startup-shader-<n>)":
+                ok + shader_patch("s002", pipeline="graphics", revision="x2w-startup-shader-12cs"),
+            "revision 'x2w-startup-mesh-57-3' is not a mesh86 key revision (x2w-startup-mesh-86-<n>)":
+                ok + shader_patch(pipeline="mesh86", revision="x2w-startup-mesh-57-3"),
+            "revision 'x2w-startup-shader-cs' is not a compute": ok + shader_patch(revision="x2w-startup-shader-cs"),
+            "revision 'x2w-startup-shader-012cs' is not a compute":
+                ok + shader_patch(revision="x2w-startup-shader-012cs"),
+            "revision 29 is not a compute": ok + shader_patch().replace('"x2w-startup-shader-12cs"', "29"),
             "files must be a non-empty array": ok + good.replace(good[good.index("files = "):], "files = []\n"),
             "files[0] has unknown keys: size": ok + good.replace('{ ext = ".txt",', '{ size = 1, ext = ".txt",'),
             "files[1] is missing: sha256": ok + good.replace(
@@ -176,7 +188,8 @@ class PatchManifest(unittest.TestCase):
                 ok + shader_patch(exts=(".txt", ".vs.cso")),
             "s001 lists .txt twice": ok + shader_patch(exts=(".txt", ".cs.cso", ".txt")),
             "s001 compute override is missing: .cs.cso": ok + shader_patch(exts=(".txt",)),
-            "s002 graphics override is missing: .vs.cso, .ps.cso": ok + shader_patch("s002", pipeline="graphics", exts=(".txt",)),
+            "s002 graphics override is missing: .vs.cso, .ps.cso":
+                ok + shader_patch("s002", pipeline="graphics", exts=(".txt",)),
             "files[0] file must be a non-empty string": ok + good.replace('file = "s001.txt"', 'file = ""'),
             "files[0] sha256 must be 64 lowercase hex digits": ok + good.replace(
                 hashlib.sha256(b"s001.txt").hexdigest(), hashlib.sha256(b"s001.txt").hexdigest().upper()),
@@ -191,22 +204,21 @@ class PatchManifest(unittest.TestCase):
                     patch_manifest.parse(case)
                 self.assertIn(message, str(caught.exception))
 
-    def test_shader_revisions_match_the_runtime(self):
-        # Each pipeline's revision, where the runtime and the translator that writes the cache spell it.
-        sites = {
-            "graphics": (("src/startup_stubs/d3d12_draw.inl", 'constexpr char revision[] = "{}";'),
-                         ("tools/startup/gfx2hlsl.py", "fnv(b'{}')")),
-            "compute": (("src/startup_stubs/d3d12_draw.inl", 'constexpr char compute_revision[] = "{}";'),
-                        ("tools/startup/gfx2hlsl.py", "fnv(b'{}')")),
-            "mesh86": (("src/startup_stubs/mesh86_cache.inl", 'constexpr char revision[] = "{}";'),
-                       ("tools/startup/mesh86_cache.py", "fnv(b'{}')")),
+    def test_shader_revision_forms_match_the_runtime(self):
+        # The runtime's current revision of each pipeline has the loader's form, so a bump (a new <n>) still loads.
+        # Whether a manifest names the current revision is for a later consumer to check against the runtime.
+        draw = (ROOT / "src/startup_stubs/d3d12_draw.inl").read_text(encoding="utf-8")
+        mesh86 = (ROOT / "src/startup_stubs/mesh86_cache.inl").read_text(encoding="utf-8")
+        found = {
+            "graphics": re.findall(r'constexpr char revision\[\] = "(x2w-startup-shader-[^"]*)";', draw),
+            "compute": re.findall(r'constexpr char compute_revision\[\] = "([^"]*)";', draw),
+            "mesh86": re.findall(r'constexpr char revision\[\] = "([^"]*)";', mesh86),
         }
-        self.assertEqual(set(sites), set(patch_manifest.PIPELINES))
-        for pipeline, places in sites.items():
-            revision = patch_manifest.PIPELINES[pipeline][0]
-            for path, spelling in places:
-                with self.subTest(f"{pipeline} in {path}"):
-                    self.assertIn(spelling.format(revision), (ROOT / path).read_text(encoding="utf-8"))
+        self.assertEqual(set(found), set(patch_manifest.PIPELINES))
+        for pipeline, revisions in found.items():
+            with self.subTest(pipeline):
+                self.assertEqual(len(revisions), 1, revisions)
+                self.assertTrue(patch_manifest.REVISIONS[pipeline].fullmatch(revisions[0]), revisions[0])
 
     def test_deep_nesting_is_refused(self):
         def nested(depth):

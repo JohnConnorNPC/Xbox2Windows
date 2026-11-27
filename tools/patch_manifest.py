@@ -43,13 +43,16 @@ KEY = re.compile(r"[0-9a-f]{16}")
 COMMON = {"id", "kind", "why", "remove_when"}
 # Every key of a kind is required. hook and data get their tables with their stages.
 KINDS = {"memory": {"rva", "expect_sha256", "bytes"}, "shader": {"key", "pipeline", "revision", "files"}}
-# Shader patches, per pipeline: the runtime's key revision (src/startup_stubs/d3d12_draw.inl and mesh86_cache.inl),
-# the translation files it reads for one key, and the ones without which it has no translation.
+# Shader patches, per pipeline: the form of the runtime's key revision (src/startup_stubs/d3d12_draw.inl and
+# mesh86_cache.inl; <n> is the number each revision bump raises), the translation files the runtime reads for one
+# key, and the ones without which it has no translation. A later consumer must check which is current.
 PIPELINES = {
-    "graphics": ("x2w-startup-shader-29", (".txt", ".vs.cso", ".ps.cso"), (".txt", ".vs.cso", ".ps.cso")),
-    "compute": ("x2w-startup-shader-29cs", (".txt", ".cs.cso"), (".txt", ".cs.cso")),
-    "mesh86": ("x2w-startup-mesh-86-1", (".mesh86.txt", ".ms.cso", ".ps.cso"), (".mesh86.txt", ".ms.cso")),
+    "graphics": ("x2w-startup-shader-<n>", (".txt", ".vs.cso", ".ps.cso"), (".txt", ".vs.cso", ".ps.cso")),
+    "compute": ("x2w-startup-shader-<n>cs", (".txt", ".cs.cso"), (".txt", ".cs.cso")),
+    "mesh86": ("x2w-startup-mesh-86-<n>", (".mesh86.txt", ".ms.cso", ".ps.cso"), (".mesh86.txt", ".ms.cso")),
 }
+REVISIONS = {name: re.compile(re.escape(form).replace("<n>", "[1-9][0-9]*"))
+             for name, (form, _, _) in PIPELINES.items()}
 
 
 def _keys(table, keys, where):
@@ -81,9 +84,10 @@ def _shader(entry, where):
     pipeline = entry["pipeline"]
     if not isinstance(pipeline, str) or pipeline not in PIPELINES:
         raise ValueError(f"{where} pipeline must be one of: {', '.join(PIPELINES)}")
-    revision, extensions, required = PIPELINES[pipeline]
-    if entry["revision"] != revision:
-        raise ValueError(f"{where} revision {entry['revision']!r} is not the runtime's {pipeline} key revision {revision}")
+    form, extensions, required = PIPELINES[pipeline]
+    revision = entry["revision"]
+    if not isinstance(revision, str) or not REVISIONS[pipeline].fullmatch(revision):
+        raise ValueError(f"{where} revision {revision!r} is not a {pipeline} key revision ({form})")
     if not isinstance(entry["files"], list) or not entry["files"]:
         raise ValueError(f"{where} files must be a non-empty array of tables")
     files = {}
