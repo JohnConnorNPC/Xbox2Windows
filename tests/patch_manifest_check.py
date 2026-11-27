@@ -119,12 +119,13 @@ class PatchManifest(unittest.TestCase):
 
     def test_memory_patches_side_by_side(self):
         # Adjacent spans do not overlap, the order of the [[patch]] tables does not matter, and RVA 0 is in range.
+        # The ids follow neither the addresses nor their reverse, so spans sorted by id either way refuse this case.
         text = manifest_text(self.digest, self.original, patches="".join(
-            memory_patch(pid, rva) for pid, rva in (("p003", SECTION_RVA + 4), ("p002", SECTION_RVA + 2),
-                                                    ("p001", SECTION_RVA), ("p000", 0))))
+            memory_patch(pid, rva) for pid, rva in (("p001", SECTION_RVA + 4), ("p003", SECTION_RVA + 2),
+                                                    ("p000", SECTION_RVA), ("p002", 0))))
         _, patches = patch_manifest.parse(text)
         self.assertEqual([(p["id"], p["rva"]) for p in patches],
-                         [("p003", SECTION_RVA + 4), ("p002", SECTION_RVA + 2), ("p001", SECTION_RVA), ("p000", 0)])
+                         [("p001", SECTION_RVA + 4), ("p003", SECTION_RVA + 2), ("p000", SECTION_RVA), ("p002", 0)])
         # One shared byte is an overlap, in either order.
         for first, second in ((SECTION_RVA, SECTION_RVA + 1), (SECTION_RVA + 1, SECTION_RVA)):
             with self.subTest(first=first, second=second):

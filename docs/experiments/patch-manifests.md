@@ -80,7 +80,7 @@ The check builds a synthetic PE32+ at run time with `build_pe32_plus` from
 - **Wrong input:** the same image with its last byte flipped makes the CLI exit with status 1 and `manifest is for another input`, with nothing on stdout. An input file that does not exist also gives status 1, with a `patch manifest: [Errno ...]` message and no traceback.
 - **Malformed manifests:** each of these is refused with its own message: a misspelled key, kind `hook`, a list or inline-table `kind`, a missing `why`, a blank `remove_when`, a duplicate id, overlapping patches, odd-length or empty `bytes`, a boolean `rva`, a 2-byte patch at `0xffffffff`, an upper-case `input_sha256`, an `input_sha256` or `expect_sha256` with trailing text, no patches, and a TOML syntax error.
 - **Edge of the RVA range:** a 1-byte patch at `0xffffffff` loads.
-- **Memory patches side by side:** four memory patches load when listed in descending RVA, three of them adjacent and one at RVA 0. Two patches that share one byte are refused as an overlap, in either order.
+- **Memory patches side by side:** four memory patches load when listed in descending RVA, three of them adjacent and one at RVA 0. Their ids follow neither the RVA order nor its reverse, so no order by id is an order by address. Two patches that share one byte are refused as an overlap, in either order.
 - **Wrong-type `kind` through the CLI:** exit status 1 with a `patch manifest:` message, and no traceback.
 - **Bytes already read:** `load_data` on the image's bytes returns what `load` returns; on the flipped image it is refused as `for another input`. With the input file then replaced by the flipped image, `load_data` on the original bytes still loads and `load` on the file is refused.
 - **Shader patches:** one per pipeline loads beside a memory patch, mesh86 with and without its `.ps.cso`, and the CLI lists their ids. Each of these is refused with its own message: a 15-digit key, a 17-digit one, an upper-case key, an unknown pipeline, another pipeline's revision (compute, graphics and the mesh57 cache's), a revision without its number, one with a leading zero, an integer revision, an empty `files`, an unknown or a missing file key, another pipeline's extension, an extension listed twice, a missing required file (compute and graphics), an empty `file`, a `file` with a `/` or a `\`, an absolute one, one with a drive, `..` and `.`, an upper-case `sha256`, two patches for one key, a memory key on a shader patch, a missing `files`, and kind `shaders`.
@@ -110,6 +110,7 @@ The check builds a synthetic PE32+ at run time with `build_pe32_plus` from
   | `bytes` pattern allows zero digit pairs (`*`) | The empty `bytes` case is accepted. |
   | Overlap check `<` changed to `<=` | The side-by-side case refuses its adjacent patches. |
   | Spans no longer sorted before the overlap check | The side-by-side case refuses its descending order. |
+  | Spans sorted by id (`key=lambda s: s[2]`), ascending or descending, instead of by address | The side-by-side case refuses its patches, whose ids do not follow the addresses. |
   | `rva` lower bound `0 <=` changed to `0 <` | The side-by-side case refuses its patch at RVA 0. |
   | `why` dropped from a memory patch | The bound-input case finds a patch without `why`. |
   | The CLI catches `ValueError` only | The missing input file ends in a traceback. |
@@ -120,3 +121,9 @@ CI job ran the first version of the check with Python 3.12 and passed.
 With the nesting, shader, `load_data` and side-by-side memory cases: 9 tests, all passed on Linux
 (Debian 13) with Python 3.13.5 and pefile 2024.8.26. Each mutation in the table above made the check
 fail, and the revision-bump control stayed green. Not yet run on Windows.
+
+With the side-by-side ids out of step with the addresses: 9 tests, all passed on Linux (Debian 13) with
+Python 3.13.5 and pefile 2024.8.26. The ascending id sort above, which passed before this change, and the
+descending one now fail the check on the side-by-side case. A sort by span end (`key=lambda s: s[1]`)
+still passes: for spans of at least one byte it flags an overlap exactly when the sort by start does, so
+it is not counted as a survivor.
