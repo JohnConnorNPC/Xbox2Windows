@@ -107,6 +107,25 @@ class PatchManifest(unittest.TestCase):
         self.assertIn("patch manifest: [[patch]] 0: kind ['memory'] is not supported", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_deep_nesting_is_refused(self):
+        def nested(depth):
+            return "x = " + "[" * depth + "]" * depth + "\n" + manifest_text(self.digest, self.original)
+
+        # Shape control: a shallow array gets past tomllib and is refused only for its unknown key.
+        with self.assertRaises(ValueError) as caught:
+            patch_manifest.parse(nested(50))
+        self.assertIn("manifest has unknown keys: x", str(caught.exception))
+        # Far past the interpreter's recursion limit (1000 by default): refused, not a RecursionError.
+        with self.assertRaises(ValueError) as caught:
+            patch_manifest.parse(nested(2000))
+        self.assertIn("manifest is nested too deeply to parse", str(caught.exception))
+        self.manifest.write_text(nested(2000), encoding="utf-8", newline="\n")
+        result = self.cli(self.input)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("patch manifest: manifest is nested too deeply to parse", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

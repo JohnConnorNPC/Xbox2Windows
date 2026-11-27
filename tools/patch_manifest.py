@@ -56,7 +56,10 @@ def _sha256(value, where):
 
 def parse(text):
     """Return (input_sha256, patches) from manifest text, or raise ValueError."""
-    data = tomllib.loads(text)
+    try:
+        data = tomllib.loads(text)
+    except RecursionError:  # tomllib recurses once per nested array or inline table
+        raise ValueError("manifest is nested too deeply to parse") from None
     _keys(data, {"target", "patch"}, "manifest")
     _keys(data["target"], {"input_sha256"}, "[target]")
     target = _sha256(data["target"]["input_sha256"], "input_sha256")

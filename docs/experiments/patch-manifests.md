@@ -25,6 +25,7 @@ bytes = "90c3"                    # the replacement, lowercase hex
 - **No partial apply:** the whole manifest is validated, and the input hash compared, before the loader returns anything. One bad patch refuses the manifest.
 - **Every patch** needs a unique `id`, a `kind`, and non-empty `why` and `remove_when`.
 - **Strict keys:** unknown keys and missing keys are refused at every level, so a misspelled key fails instead of being ignored.
+- **Nesting:** `tomllib` recurses once per nested array or inline table. A manifest nested past the interpreter's recursion limit is refused with `manifest is nested too deeply to parse`, and the CLI exits with status 1 instead of printing a traceback.
 - **Kinds:** `kind` must be a string, and only `memory` is defined. `hook` and `data` are refused as `not supported` until their stages land.
 - **Memory patches:** `bytes` must be non-empty, and every byte it replaces needs an RVA below 2^32: a 1-byte patch at `0xffffffff` is accepted, a 2-byte one is not. Two memory patches may not overlap. Whether the span lies in a mapped section is checked later, by the runtime stage.
 - **Original bytes are never stored:** `expect_sha256` is a hash of the bytes the patch replaces. The loader only checks its shape; the memory stage will compare it with the mapped image.
@@ -50,6 +51,7 @@ The check builds a synthetic PE32+ at run time with `build_pe32_plus` from
 - **Malformed manifests:** each of these is refused with its own message: a misspelled key, kind `hook`, a list or inline-table `kind`, a missing `why`, a blank `remove_when`, a duplicate id, overlapping patches, odd-length `bytes`, a boolean `rva`, a 2-byte patch at `0xffffffff`, an upper-case `input_sha256`, no patches, and a TOML syntax error.
 - **Edge of the RVA range:** a 1-byte patch at `0xffffffff` loads.
 - **Wrong-type `kind` through the CLI:** exit status 1 with a `patch manifest:` message, and no traceback.
+- **Deep nesting:** an array nested 2000 deep is refused as `nested too deeply`, by `parse` and through the CLI (status 1, nothing on stdout, no traceback). Shape control: one nested 50 deep gets past `tomllib` and is refused only for its unknown key.
 - **Mutations:**
 
   | Change | Result |
@@ -59,6 +61,7 @@ The check builds a synthetic PE32+ at run time with `build_pe32_plus` from
   | String check on `kind` removed | Both wrong-type cases raise `TypeError`, and the CLI prints a traceback. |
   | Span check removed | The 2-byte patch at `0xffffffff` is accepted. |
   | Span check off by one (`>=`) | The 1-byte case at `0xffffffff` is refused. |
+  | `RecursionError` no longer caught | The deep-nesting case raises `RecursionError`, and the CLI prints a traceback. |
 
 Measured on 27.11.2026 on Windows 11 Pro with Python 3.14: 3 tests, all passed. The `python-linux`
 CI job ran the first version of the check with Python 3.12 and passed.
