@@ -76,13 +76,14 @@ On Windows: `ctest --preset dev --no-tests=error -R '^patch_manifest_controls$' 
 The check builds a synthetic PE32+ at run time with `build_pe32_plus` from
 `tests/call_evidence_check.py`. Its manifest replaces two bytes at the start of the `.rdata` section.
 
-- **Bound input:** the manifest loads, and the CLI prints the manifest hash and `p001`.
-- **Wrong input:** the same image with its last byte flipped makes the CLI exit with status 1 and `manifest is for another input`, with nothing on stdout.
-- **Malformed manifests:** each of these is refused with its own message: a misspelled key, kind `hook`, a list or inline-table `kind`, a missing `why`, a blank `remove_when`, a duplicate id, overlapping patches, odd-length `bytes`, a boolean `rva`, a 2-byte patch at `0xffffffff`, an upper-case `input_sha256`, no patches, and a TOML syntax error.
+- **Bound input:** the manifest loads with every field of `p001` as written, and the CLI prints the manifest hash and `p001`.
+- **Wrong input:** the same image with its last byte flipped makes the CLI exit with status 1 and `manifest is for another input`, with nothing on stdout. An input file that does not exist also gives status 1, with a `patch manifest: [Errno ...]` message and no traceback.
+- **Malformed manifests:** each of these is refused with its own message: a misspelled key, kind `hook`, a list or inline-table `kind`, a missing `why`, a blank `remove_when`, a duplicate id, overlapping patches, odd-length or empty `bytes`, a boolean `rva`, a 2-byte patch at `0xffffffff`, an upper-case `input_sha256`, an `input_sha256` or `expect_sha256` with trailing text, no patches, and a TOML syntax error.
 - **Edge of the RVA range:** a 1-byte patch at `0xffffffff` loads.
+- **Memory patches side by side:** four memory patches load when listed in descending RVA, three of them adjacent and one at RVA 0. Two patches that share one byte are refused as an overlap, in either order.
 - **Wrong-type `kind` through the CLI:** exit status 1 with a `patch manifest:` message, and no traceback.
 - **Bytes already read:** `load_data` on the image's bytes returns what `load` returns; on the flipped image it is refused as `for another input`. With the input file then replaced by the flipped image, `load_data` on the original bytes still loads and `load` on the file is refused.
-- **Shader patches:** one per pipeline loads beside a memory patch, mesh86 with and without its `.ps.cso`, and the CLI lists their ids. Each of these is refused with its own message: a 15-digit key, an upper-case key, an unknown pipeline, another pipeline's revision (compute, graphics and the mesh57 cache's), a revision without its number, one with a leading zero, an integer revision, an empty `files`, an unknown or a missing file key, another pipeline's extension, an extension listed twice, a missing required file (compute and graphics), an empty `file`, a `file` with a `/` or a `\`, an absolute one, one with a drive, `..` and `.`, an upper-case `sha256`, two patches for one key, a memory key on a shader patch, a missing `files`, and kind `shaders`.
+- **Shader patches:** one per pipeline loads beside a memory patch, mesh86 with and without its `.ps.cso`, and the CLI lists their ids. Each of these is refused with its own message: a 15-digit key, a 17-digit one, an upper-case key, an unknown pipeline, another pipeline's revision (compute, graphics and the mesh57 cache's), a revision without its number, one with a leading zero, an integer revision, an empty `files`, an unknown or a missing file key, another pipeline's extension, an extension listed twice, a missing required file (compute and graphics), an empty `file`, a `file` with a `/` or a `\`, an absolute one, one with a drive, `..` and `.`, an upper-case `sha256`, two patches for one key, a memory key on a shader patch, a missing `files`, and kind `shaders`.
 - **Files pinned:** each pipeline's extensions are the ones its loader in the runtime reads for a key (`cache_path(..., L"", key, ext)` in `d3d12_draw.inl`, `d3d12_compute_dispatch.inl` and `mesh86_cache.inl`, and mesh86's `load_stage`), and mesh86's `.ps.cso` is the only optional one, read only for a request with a pixel shader.
 - **Revision forms pinned:** the runtime's current revision of each pipeline, read from its source, has the loader's form. A bump that only raises `<n>` keeps the check green. The fixture uses revisions of each form that are not the runtime's current ones.
 - **Deep nesting:** with the recursion limit set to 1000 inside the test, an array nested 2000 deep is refused as `nested too deeply`, by `parse` and through the CLI (status 1, nothing on stdout, no traceback). Shape control: one nested 50 deep gets past `tomllib` and is refused only for its unknown key.
@@ -104,10 +105,18 @@ The check builds a synthetic PE32+ at run time with `build_pe32_plus` from
   | Required-file check removed | Both missing-file cases are accepted. |
   | Same-key check removed | The two-patches-for-one-key case is accepted. |
   | `RecursionError` no longer caught | The deep-nesting case raises `RecursionError`. |
+  | `SHA256.fullmatch` changed to `match` | The `input_sha256` and `expect_sha256` cases with trailing text are accepted. |
+  | Shader `KEY.fullmatch` changed to `match` | The 17-digit key is accepted. |
+  | `bytes` pattern allows zero digit pairs (`*`) | The empty `bytes` case is accepted. |
+  | Overlap check `<` changed to `<=` | The side-by-side case refuses its adjacent patches. |
+  | Spans no longer sorted before the overlap check | The side-by-side case refuses its descending order. |
+  | `rva` lower bound `0 <=` changed to `0 <` | The side-by-side case refuses its patch at RVA 0. |
+  | `why` dropped from a memory patch | The bound-input case finds a patch without `why`. |
+  | The CLI catches `ValueError` only | The missing input file ends in a traceback. |
 
 Measured on 27.11.2026 on Windows 11 Pro with Python 3.14: 3 tests, all passed. The `python-linux`
 CI job ran the first version of the check with Python 3.12 and passed.
 
-With the nesting, shader and `load_data` cases: 8 tests, all passed on Linux (Debian 13) with Python
-3.13.5 and pefile 2024.8.26. Each mutation in the table above made the check fail, and the revision-bump
-control stayed green. Not yet run on Windows.
+With the nesting, shader, `load_data` and side-by-side memory cases: 9 tests, all passed on Linux
+(Debian 13) with Python 3.13.5 and pefile 2024.8.26. Each mutation in the table above made the check
+fail, and the revision-bump control stayed green. Not yet run on Windows.
