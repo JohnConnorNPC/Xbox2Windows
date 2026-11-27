@@ -246,7 +246,11 @@ class PatchManifest(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             patch_manifest.parse(nested(50))
         self.assertIn("manifest has unknown keys: x", str(caught.exception))
-        # Far past the interpreter's recursion limit (1000 by default): refused, not a RecursionError.
+        # Twice the recursion limit, set here so a runner that raised it cannot parse the array: refused, not a
+        # RecursionError. The CLI runs in a new interpreter, whose limit is the default 1000.
+        limit = sys.getrecursionlimit()
+        self.addCleanup(sys.setrecursionlimit, limit)
+        sys.setrecursionlimit(1000)
         with self.assertRaises(ValueError) as caught:
             patch_manifest.parse(nested(2000))
         self.assertIn("manifest is nested too deeply to parse", str(caught.exception))
