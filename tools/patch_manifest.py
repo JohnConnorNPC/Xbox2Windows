@@ -40,6 +40,10 @@ import tomllib
 SHA256 = re.compile(r"[0-9a-f]{64}")
 HEX = re.compile(r"(?:[0-9a-f]{2})+")
 KEY = re.compile(r"[0-9a-f]{16}")
+# Names Windows opens as a device instead of a file in the directory, alone or before an extension (Microsoft,
+# "Naming Files, Paths, and Namespaces"). Matched against the part before the first dot, trailing spaces dropped.
+DEVICE = re.compile(r"(?:con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$)",
+                    re.IGNORECASE)
 COMMON = {"id", "kind", "why", "remove_when"}
 # Every key of a kind is required. hook and data get their tables with their stages.
 KINDS = {"memory": {"rva", "expect_sha256", "bytes"}, "shader": {"key", "pipeline", "revision", "files"}}
@@ -77,10 +81,20 @@ def _sha256(value, where):
 
 
 def _file_name(value, where):
-    """A bare file name, for a later consumer to resolve in the manifest's directory."""
+    """A bare file name, for a later consumer to resolve in the manifest's directory.
+
+    That consumer is the runtime, which runs on Windows, so a name that Windows would not resolve to a file of that
+    name in the directory is refused too: one it cannot hold, one whose trailing dot or space it drops, a device.
+    """
     name = _text(value, where)
     if any(c in name for c in "/\\:") or name in (".", ".."):
         raise ValueError(f"{where} {name!r} must be a bare file name, without a directory, drive or '..'")
+    if any(c in '<>"|?*' for c in name) or any(ord(c) < 32 for c in name):
+        raise ValueError(f"{where} {name!r} has a character a Windows file name cannot hold")
+    if name.endswith((".", " ")):
+        raise ValueError(f"{where} {name!r} ends in a dot or a space, which Windows drops")
+    if DEVICE.fullmatch(name.split(".", 1)[0].rstrip(" ")):
+        raise ValueError(f"{where} {name!r} is a Windows device name")
     return name
 
 

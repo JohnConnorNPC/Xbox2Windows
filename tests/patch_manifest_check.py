@@ -241,6 +241,17 @@ class PatchManifest(unittest.TestCase):
             **{f"files[0] file {name!r} must be a bare file name":
                ok + good.replace('file = "s001.txt"', f"file = '{name}'")
                for name in ("sub/s001.txt", "sub\\s001.txt", "/s001.txt", "C:s001.txt", "..", ".")},
+            # The runtime that reads these files runs on Windows: names it can't hold, shortens or opens as a device.
+            **{f"files[0] file {name!r} has a character a Windows file name cannot hold":
+               ok + good.replace('file = "s001.txt"', f"file = '{name}'")
+               for name in ("a*b", "a?b", "a<b", "a>b", "a|b", 'a"b', "a\tb")},
+            "files[0] file 'a\\x01b' has a character": ok + good.replace('file = "s001.txt"', 'file = "a\\u0001b"'),
+            **{f"files[0] file {name!r} ends in a dot or a space, which Windows drops":
+               ok + good.replace('file = "s001.txt"', f"file = '{name}'") for name in ("s001.txt.", "s001.txt ")},
+            **{f"files[0] file {name!r} is a Windows device name":
+               ok + good.replace('file = "s001.txt"', f"file = '{name}'")
+               for name in ("NUL", "CON.txt", "Com1", "nul .txt", "CONIN$", "conout$.txt",
+                            "COM\u00b9", "lpt\u00b3.cso")},
             "files[0] sha256 must be 64 lowercase hex digits": ok + good.replace(
                 hashlib.sha256(b"s001.txt").hexdigest(), hashlib.sha256(b"s001.txt").hexdigest().upper()),
             "patches s001 and s002 override the same key 00c0ffee0badf00d": ok + good + shader_patch("s002"),
@@ -253,6 +264,11 @@ class PatchManifest(unittest.TestCase):
                 with self.assertRaises(ValueError) as caught:
                     patch_manifest.parse(case)
                 self.assertIn(message, str(caught.exception))
+        # A device name only as a prefix, a space inside a name and a leading dot are still file names.
+        for name in ("console.txt", "nulls.cso", "a b.txt", "com10.txt", "conin.txt", ".s001.txt"):
+            with self.subTest(name):
+                _, patches = patch_manifest.parse(ok + good.replace('file = "s001.txt"', f"file = '{name}'"))
+                self.assertEqual(patches[-1]["files"][0]["file"], name)
 
     def test_shader_revision_forms_match_the_runtime(self):
         # The runtime's current revision of each pipeline has the loader's form, so a bump (a new <n>) still loads.
