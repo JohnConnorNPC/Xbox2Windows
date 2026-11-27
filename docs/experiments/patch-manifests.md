@@ -58,7 +58,7 @@ files = [{ ext = ".txt", file = "s001.txt", sha256 = "<sha256 of the file>" },
 | `mesh86` | `x2w-startup-mesh-86-<n>` | `.mesh86.txt`, `.ms.cso`, `.ps.cso` | `.mesh86.txt`, `.ms.cso` |
 
 - **Revision:** `revision` must have the form of the pipeline's key revision in the runtime (`src/startup_stubs/d3d12_draw.inl`, `src/startup_stubs/mesh86_cache.inl`), where `<n>` is a number without leading zeros, so another pipeline's revision is refused. The loader does not check that `<n>` is the runtime's current one: the runtime bumps it often, and a new revision changes every key. A later consumer that serves the files must compare it with the runtime; none exists yet.
-- **Files:** each entry is a table of exactly `ext`, `file` and `sha256`. `ext` is one of the pipeline's files and is listed once; the required ones must all be there. `file` is a non-empty path for the consumer to resolve; `sha256` is lowercase.
+- **Files:** each entry is a table of exactly `ext`, `file` and `sha256`. `ext` is one of the pipeline's files and is listed once; the required ones must all be there. `file` is a bare file name, for a later consumer to resolve in the manifest's directory: a `/` or `\`, a drive (`:`), `.` and `..` are refused. `sha256` is lowercase.
 - **One patch per key:** two shader patches for the same `key` are refused. Shader patches take no part in the memory overlap check.
 
 Input-specific manifests stay local under `game-files/patches/`, which is gitignored. Do not
@@ -82,7 +82,7 @@ The check builds a synthetic PE32+ at run time with `build_pe32_plus` from
 - **Edge of the RVA range:** a 1-byte patch at `0xffffffff` loads.
 - **Wrong-type `kind` through the CLI:** exit status 1 with a `patch manifest:` message, and no traceback.
 - **Bytes already read:** `load_data` on the image's bytes returns what `load` returns; on the flipped image it is refused as `for another input`. With the input file then replaced by the flipped image, `load_data` on the original bytes still loads and `load` on the file is refused.
-- **Shader patches:** one per pipeline loads beside a memory patch, mesh86 with and without its `.ps.cso`, and the CLI lists their ids. Each of these is refused with its own message: a 15-digit key, an upper-case key, an unknown pipeline, another pipeline's revision (compute, graphics and the mesh57 cache's), a revision without its number, one with a leading zero, an integer revision, an empty `files`, an unknown or a missing file key, another pipeline's extension, an extension listed twice, a missing required file (compute and graphics), an empty `file`, an upper-case `sha256`, two patches for one key, a memory key on a shader patch, a missing `files`, and kind `shaders`.
+- **Shader patches:** one per pipeline loads beside a memory patch, mesh86 with and without its `.ps.cso`, and the CLI lists their ids. Each of these is refused with its own message: a 15-digit key, an upper-case key, an unknown pipeline, another pipeline's revision (compute, graphics and the mesh57 cache's), a revision without its number, one with a leading zero, an integer revision, an empty `files`, an unknown or a missing file key, another pipeline's extension, an extension listed twice, a missing required file (compute and graphics), an empty `file`, a `file` with a `/` or a `\`, an absolute one, one with a drive, `..` and `.`, an upper-case `sha256`, two patches for one key, a memory key on a shader patch, a missing `files`, and kind `shaders`.
 - **Revision forms pinned:** the runtime's current revision of each pipeline, read from its source, has the loader's form. A bump that only raises `<n>` keeps the check green. The fixture uses revisions of each form that are not the runtime's current ones.
 - **Deep nesting:** an array nested 2000 deep is refused as `nested too deeply`, by `parse` and through the CLI (status 1, nothing on stdout, no traceback). Shape control: one nested 50 deep gets past `tomllib` and is refused only for its unknown key.
 - **Mutations:**
@@ -96,6 +96,7 @@ The check builds a synthetic PE32+ at run time with `build_pe32_plus` from
   | Span check off by one (`>=`) | The 1-byte case at `0xffffffff` is refused. |
   | `load_data` compares the target with itself | The flipped image is accepted by `load_data`. |
   | Revision form check removed | The other-pipeline and malformed revision cases are accepted. |
+  | Bare-name check on `file` removed | The six non-bare `file` cases are accepted. |
   | Required-file check removed | Both missing-file cases are accepted. |
   | Same-key check removed | The two-patches-for-one-key case is accepted. |
   | `RecursionError` no longer caught | The deep-nesting case raises `RecursionError`, and the CLI prints a traceback. |

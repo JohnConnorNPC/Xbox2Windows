@@ -76,6 +76,14 @@ def _sha256(value, where):
     return value
 
 
+def _file_name(value, where):
+    """A bare file name, for a later consumer to resolve in the manifest's directory."""
+    name = _text(value, where)
+    if any(c in name for c in "/\\:") or name in (".", ".."):
+        raise ValueError(f"{where} {name!r} must be a bare file name, without a directory, drive or '..'")
+    return name
+
+
 def _shader(entry, where):
     """The key, pipeline, revision and files of a shader patch, checked for shape only."""
     key = entry["key"]
@@ -99,7 +107,7 @@ def _shader(entry, where):
             raise ValueError(f"{at} ext {ext!r} is not a {pipeline} translation file ({', '.join(extensions)})")
         if ext in files:
             raise ValueError(f"{where} lists {ext} twice")
-        files[ext] = {"ext": ext, "file": _text(item["file"], f"{at} file"),
+        files[ext] = {"ext": ext, "file": _file_name(item["file"], f"{at} file"),
                       "sha256": _sha256(item["sha256"], f"{at} sha256")}
     if missing := [ext for ext in required if ext not in files]:
         raise ValueError(f"{where} {pipeline} override is missing: {', '.join(missing)}")

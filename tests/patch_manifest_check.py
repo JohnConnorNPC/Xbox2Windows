@@ -191,6 +191,9 @@ class PatchManifest(unittest.TestCase):
             "s002 graphics override is missing: .vs.cso, .ps.cso":
                 ok + shader_patch("s002", pipeline="graphics", exts=(".txt",)),
             "files[0] file must be a non-empty string": ok + good.replace('file = "s001.txt"', 'file = ""'),
+            **{f"files[0] file {name!r} must be a bare file name":
+               ok + good.replace('file = "s001.txt"', f"file = '{name}'")
+               for name in ("sub/s001.txt", "sub\\s001.txt", "/s001.txt", "C:s001.txt", "..", ".")},
             "files[0] sha256 must be 64 lowercase hex digits": ok + good.replace(
                 hashlib.sha256(b"s001.txt").hexdigest(), hashlib.sha256(b"s001.txt").hexdigest().upper()),
             "patches s001 and s002 override the same key 00c0ffee0badf00d": ok + good + shader_patch("s002"),
