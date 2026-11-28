@@ -555,6 +555,7 @@ extern "C" __declspec(noinline) long XApuEnqueueCommand(u64 rcx, u64 rdx, u64 r8
     if (decode && !x2w_local::readable(reinterpret_cast<const void*>(rdx), decode_command_size)) {
         x2w_audio::saturating_add(opus_counts.refused_short_command);
         x2w_local::logf("x2w-audio XApuEnqueueCommand handle=0x%llx short decode command -> E_POINTER", rcx);
+        count_command(hr_pointer, reinterpret_cast<const void*>(rdx));  // its header was read: counted as class 3
         return hr_pointer;
     }
 #endif

@@ -276,6 +276,29 @@ void script(const Api& api, bool on)
     std::memcpy(command, &one, sizeof(one));
     sentinel();
     note("XApuEnqueueCommand unknown handle", api.enqueue(handle + 0x100, command, 0, 0));
+    // A type 3 command whose 8-byte header ends where free address space begins (the rest of the page's allocation
+    // granule), sent with typed completions on. An X2W_WITH_OPUS build refuses it with E_POINTER before the queue, as
+    // too short to decode, and must still count it as class 3; without Opus it is queued like any other command.
+    // X2W_PROBE_PRECHECK=1 (every case) refuses the free tail without touching it, so no fault is taken. Typed
+    // completions are set for this call only.
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    auto* page = static_cast<unsigned char*>(
+        VirtualAlloc(nullptr, system.dwPageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    MEMORY_BASIC_INFORMATION after{};
+    const bool free_after =
+        page && VirtualQuery(page + system.dwPageSize, &after, sizeof(after)) && after.State == MEM_FREE;
+    check(free_after, "free address space after the short command");
+    if (free_after) {
+        unsigned char* short_command = page + system.dwPageSize - 8;
+        const std::uint32_t three = 3;
+        std::memcpy(short_command, &three, sizeof(three));
+        SetEnvironmentVariableA("X2W_XAPU_TYPED_COMPLETIONS", "1");
+        sentinel();
+        note("XApuEnqueueCommand short type 3 command", api.enqueue(handle, short_command, 0, 0));
+        SetEnvironmentVariableA("X2W_XAPU_TYPED_COMPLETIONS", nullptr);
+    }
+    if (page) VirtualFree(page, 0, MEM_RELEASE);
     sentinel();
     const std::uint32_t pending = api.result_count(handle, 0);
     note("XApuGetResultCount", 0, pending);
@@ -291,7 +314,7 @@ void script(const Api& api, bool on)
     sentinel();
     note("XApuDisconnect", api.disconnect(handle));
     expect_on("XApu commands", take(api.xapu_counts), on, xapu_fields,
-              {{1, 3}, {2, 2}, {class_other, 1}, {unreadable, 1}, {rejected, 1}});
+              {{1, 3}, {2, 2}, {3, 1}, {class_other, 1}, {unreadable, 1}, {rejected, 1}});
 
     unsigned hash = 2166136261u;  // FNV-1a of the context bytes: the counter never writes caller memory
     for (std::uint32_t i = 0; i < contexts * 64; ++i) hash = (hash ^ base[i]) * 16777619u;
@@ -428,8 +451,8 @@ int run_case(const char* name, const char* acphal_path, const char* xapu_path, c
         if (on) {
             const std::map<std::string, u64> want = {
                 {"xma.filled", 5},   {"xma.changed", 3},       {"xma.cleared", 2}, {"xma.submits", 4}, {"xma.1", 2},
-                {"xma.3", 1},        {"xma.other", 1},         {"xapu.commands", 7}, {"xapu.1", 3},    {"xapu.2", 2},
-                {"xapu.other", 1},   {"xapu.unreadable", 1},   {"xapu.rejected", 1}};
+                {"xma.3", 1},        {"xma.other", 1},         {"xapu.commands", 8}, {"xapu.1", 3},    {"xapu.2", 2},
+                {"xapu.3", 1},       {"xapu.other", 1},        {"xapu.unreadable", 1}, {"xapu.rejected", 1}};
             std::map<std::string, u64> got;
             int lines = 0;
             for (int waited = 0; waited <= 5000; waited += 100) {  // a call a second after the start writes the line
@@ -467,6 +490,7 @@ DWORD spawn(const char* self, const char* name, const char* acphal, const char* 
     const std::string log = dir + "\\" + name + ".log", out = dir + "\\" + name + ".txt";
     SetEnvironmentVariableA("X2W_AUDIO_PERMISSIVE", "1");
     SetEnvironmentVariableA("X2W_AUDIO_ACTIVITY", std::strcmp(name, "off") ? "1" : nullptr);
+    SetEnvironmentVariableA("X2W_PROBE_PRECHECK", "1");  // the short command's free tail is refused, not touched
     SetEnvironmentVariableA("X2W_TRAP_LOG", log.c_str());
     std::string cmd = std::string("\"") + self + "\" --case " + name + " \"" + acphal + "\" \"" + xapu + "\" \"" + out + "\"";
     // The child writes to this process's stdout and stderr, so its lines reach the CTest log.

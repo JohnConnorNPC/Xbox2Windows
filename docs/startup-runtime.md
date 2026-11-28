@@ -3144,8 +3144,8 @@ it is read: one that goes from all zero to nonzero counts as filled, one that ch
 returns to all zero as cleared. HAL slot2 submits are counted by their type argument. `xapu.dll` counts every
 `XApuEnqueueCommand` call by command class, taken as the first `UINT32` of the command, with no cap; unreadable commands
 and unknown handles are counted apart; `commands=` is the classes plus the unreadable commands, and `rejected=` calls
-are not in it. Not counted: in an `X2W_WITH_OPUS` build with `X2W_XAPU_TYPED_COMPLETIONS=1`, a type 3
-command too short to decode, which returns `E_POINTER` before the count.
+are not in it. In an `X2W_WITH_OPUS` build with `X2W_XAPU_TYPED_COMPLETIONS=1`, a type 3 command too short to decode
+returns `E_POINTER` before the queue and is still counted, as class 3.
 Neither DLL starts a thread: a counted call at least a second after a DLL's previous line (or its first
 counted call) logs the next line, with the counts since that line, only when a count moved, so nothing of either DLL
 runs after a caller unloads it. Until then the counts wait for a later call: counts from the last second before a
