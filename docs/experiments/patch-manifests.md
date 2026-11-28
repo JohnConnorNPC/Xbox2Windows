@@ -1,9 +1,10 @@
-# Patch manifests: schema, loader and hash gate
+# Patch manifests: schema, loader, hash gate and memory patches
 
 A patch manifest describes adjustments to a source-translated build without changing the input
-file on disk. This first step defines the format and the loader, `tools/patch_manifest.py`.
-Nothing applies a patch yet. Memory patches at load time, data patches in the file layer and
-translator hooks will each come in their own change ([#3037](https://github.com/R0Y00/Xbox2Windows/issues/3037)).
+file on disk. The format and the loader are in `tools/patch_manifest.py`. Stage 2, `memory` patches
+that the startup debugger writes into the title's image, is planned by `tools/startup/patch_plan.py`
+([Memory patches](#memory-patches-stage-2)). Data patches in the file layer and translator hooks
+will each come in their own change ([#3037](https://github.com/R0Y00/Xbox2Windows/issues/3037)).
 
 ## Format
 
@@ -28,8 +29,8 @@ bytes = "90c3"                    # the replacement, lowercase hex
 - **Strict keys:** unknown keys and missing keys are refused at every level, so a misspelled key fails instead of being ignored.
 - **Nesting:** `tomllib` recurses once per nested array or inline table. A manifest nested past the interpreter's recursion limit is refused with `manifest is nested too deeply to parse`, and the CLI exits with status 1 instead of printing a traceback.
 - **Kinds:** `kind` must be a string, and `memory` and `shader` are defined. `hook`, `data` and any other kind are refused as `not supported`.
-- **Memory patches:** `bytes` must be non-empty, and every byte it replaces needs an RVA below 2^32: a 1-byte patch at `0xffffffff` is accepted, a 2-byte one is not. Two memory patches may not overlap. Whether the span lies in a mapped section is checked later, by the runtime stage.
-- **Original bytes are never stored:** `expect_sha256` is a hash of the bytes the patch replaces. The loader only checks its shape; the memory stage will compare it with the mapped image.
+- **Memory patches:** `bytes` must be non-empty, and every byte it replaces needs an RVA below 2^32: a 1-byte patch at `0xffffffff` is accepted, a 2-byte one is not. Two memory patches may not overlap. Whether the span lies in a section's file-backed bytes is checked by the planner ([Memory patches](#memory-patches-stage-2)).
+- **Original bytes are never stored:** `expect_sha256` is a hash of the bytes the patch replaces. The loader only checks its shape; the planner compares it with the input's bytes and the debugger with the mapped image.
 - **Reporting:** the loader returns `manifest_sha256`, the SHA-256 of the manifest file's bytes, with the patch ids, for run reports to record.
 
 ### Shader patches
@@ -73,7 +74,8 @@ publish them or the hashes in them.
 python -B tools/patch_manifest.py MANIFEST INPUT
 ```
 
-On Windows: `ctest --preset dev --no-tests=error -R '^patch_manifest_controls$' -V`.
+On Windows: `ctest --preset dev --no-tests=error -R '^patch_manifest_controls$' -V`. The planner and the
+debugger have their own checks ([Memory patches](#memory-patches-stage-2)).
 
 The check builds a synthetic PE32+ at run time with `build_pe32_plus` from
 `tests/call_evidence_check.py`. Its manifest replaces two bytes at the start of the `.rdata` section.
@@ -143,3 +145,153 @@ it is not counted as a survivor.
 With the Windows file-name refusals (review of `4968e124`): 9 tests, all passed on Linux (Debian 13) with
 Python 3.13.5 and pefile 2024.8.26. Each of the twelve mutations of the refusal in the table above made the
 check fail, and the 24 earlier loader mutations still did. Not run on Windows.
+
+## Memory patches (stage 2)
+
+Set `X2W_PATCHES=<manifest.toml>` for a startup debugger run (`run.ps1`, `run.sh` or
+`debug_launch.py` directly). Under Wine the debugger is a Windows Python, so the path must be one it
+can open, such as `Z:/home/.../manifest.toml`. Before the process exists, the debugger reads the EXE
+it is about to pass to `CreateProcessW` once and loads the manifest with `load_data` on those bytes,
+so the gate and the plan use the same bytes. `tools/startup/patch_plan.py` raises every loader
+refusal with the loader's reason and adds its own rules, each of which refuses the whole manifest:
+
+- `id` matches `[a-z0-9][a-z0-9._-]{0,63}`: the run summary joins ids with commas.
+- Every patch is `memory`: the debugger has no consumer for `shader` patches.
+- One patch replaces at most 4096 bytes, and a manifest holds at most 4096 `[[patch]]` entries (the
+  plan compares every patch with every base relocation and loader-written range).
+
+The plan then refuses the whole manifest when a patch range:
+
+- starts in the headers, or anywhere outside one section's file-backed bytes, which are
+  `[VirtualAddress, VirtualAddress + min(VirtualSize, SizeOfRawData))`. File bytes past
+  `VirtualSize` and virtual-only tails are refused;
+- runs past those bytes or crosses into the next section. An input with a section that ends past
+  `SizeOfImage` is refused whole. So is an input with a section whose file-backed bytes start at a
+  `PointerToRawData` that is not a multiple of 0x200: pefile 2024.8.26, which the CPU lifter reads
+  the input with, maps such a section from the offset rounded down to 0x200, whatever
+  `FileAlignment` says, so it and the plan would disagree on the bytes;
+- touches a base relocation entry (DIR64 covers 8 bytes, HIGHLOW 4, ABSOLUTE padding nothing; any
+  other type refuses the plan);
+- touches a slot the loader writes after mapping: an import address table (each import descriptor's
+  `FirstThunk` array, terminator included; descriptors are read from the directory's RVA up to the
+  null one, as the loaders read them), the TLS index slot, or a load configuration slot: the
+  security cookie, the control-flow guard check and dispatch pointers, the XFG check, dispatch and
+  table dispatch pointers, the CastGuard failure mode and the guard memcpy pointer, each when the
+  configuration's own `Size` field or the directory's `Size` covers it. Inputs with delay-load
+  imports are refused. The import, TLS, load-configuration and delay-import directories count as
+  present when their RVA is set, whatever their `Size` says, and every structure read must lie in
+  one section's file-backed bytes. A delay-load table that no directory names is not detected;
+- holds input bytes whose SHA-256 is not `expect_sha256`.
+
+Overlapping patches and spans past 2^32 never reach the plan: the loader refuses them.
+
+The patches are written at the process's CREATE_PROCESS debug event, before any code of the process
+runs. The gate read the EXE by its path before `CreateProcessW` opened that path again, so the
+debugger first hashes the file the process was created from, through the file handle the event hands
+it, and refuses unless that is still `input_sha256`: an EXE replaced in between is not patched, even
+where it differs only outside the patch ranges. Every range is read and hashed next; a short read or
+a different hash refuses before the first write. Each write checks the protection change, the full
+byte count and the protection restore, and every range is read back. At the loader's initial
+breakpoint, before the debugger arms `X2W_COUNT`, `X2W_REDIRECT` or `X2W_LOG_AT` breakpoints, every
+range is checked again, and a breakpoint address inside a patch is logged to `events.txt`. Any
+refusal ends the run: the process is terminated before it continues, the summary says `patches:
+refused: <reason>` and `debug_launch.py` exits 3. A refusal after the first write can leave earlier
+ranges written in the process, which never runs.
+
+The loader breakpoint is not early enough on its own. In Wine's `dlls/ntdll/loader.c`
+(`loader_init`, master as read on 2026-11-27) the static imports' `DLL_PROCESS_ATTACH` and the
+main image's TLS callbacks run before `process_breakpoint()`. The fixture's TLS callback shows
+whether the patch was in place before the first code of the image ran. So under Wine the
+loader-breakpoint re-check runs after the TLS callbacks and DLL initializers: a loader write over a
+patch is caught there only after that code has run. On Windows the breakpoint comes before both.
+
+Every debugger run prints `patches: none`, or `patches: manifest sha256=<hex> active=<ids>` once the
+loader-breakpoint re-check has passed, to the console summary, `finished.txt` and `events.txt`. A
+process that ends after the write but before that breakpoint gets `patches: unverified manifest ...`
+instead. The child environment never inherits `X2W_PATCHES`, `X2W_DATA_PATCH_MAP` or any
+`X2W_PATCH_*` variable from the shell (names compared case-blind), so a leftover value cannot change
+the title unreported. `launch.py` refuses `X2W_PATCHES` with exit code 3 instead of running the
+title unpatched.
+
+`X2W_PATCH_TEST_FAULT=apply|verify|image` is for the fixture only. It drops the last byte of each
+read at that step: the process memory at the write step or the loader breakpoint, or the image file
+through the CREATE_PROCESS handle, which is then hashed without its last byte. It never changes the
+expected bytes. Each step refuses such a read whatever the memory or the file holds, so the switch
+can only turn a pass into a refusal. The child never sees it.
+
+### Check or plan a manifest
+
+```bash
+python3 -B tools/startup/patch_plan.py check <manifest.toml> <input>
+python3 -B tools/startup/patch_plan.py plan <manifest.toml> <input.exe>
+```
+
+`check` loads the manifest through the loader, with the hash gate, and applies the planner's rules.
+`plan` also plans every memory patch against the input PE, as the debugger does. They print
+`patches: ok manifest sha256=<hex> patches=<n>` (`plan` adds ` planned`) and exit 0, or print
+`patches: refused: <reason>` and exit 3. A usage error exits 2.
+
+### Test
+
+```bash
+python3 -B tests/patch_plan_check.py
+```
+
+Expected result: `patch_plan: PASS (125 cases: ...)`, exit 0. The check fails if a different number
+of cases runs. The Linux CI job runs it from `tests/checks/python-linux/patch_plan.txt`, and CTest as
+`patch_plan_controls`. The schema input is a synthetic PE32+ built by the test, and the first case
+parses it back and checks its layout. Each loader refusal the planner passes on is checked by its
+message: unknown, missing and blank keys, kinds `hook`, `data` and `code`, an upper-case
+`input_sha256`, malformed hashes and `bytes`, an `rva` that is a string, a boolean, negative or past
+32 bits, invalid TOML, a duplicate TOML key, nesting deeper than `tomllib` parses, a file that is not
+UTF-8, a manifest without patches, without `[target]` or with an empty `patch` array, and a missing
+manifest file. The planner's own rules: an upper-case id, one of 65 characters and a shader patch
+the loader accepts are refused; 4096 bytes and 4096 patches load, and 4097 of either are refused. The gate
+is checked with hashes that are wrong only in the last hex digit or only in the first (both refused),
+so a gate that compares only a prefix or a suffix fails the check. The loader is pinned as
+`tools/patch_manifest.py`, and neither it nor `tomllib` is imported until a manifest is loaded.
+
+The plan input is a second synthetic PE32+ with an import table, a TLS directory, a load
+configuration and two base relocation blocks, which its own case parses back. A copy with a second
+import descriptor past the directory's `Size` of 20 has that descriptor's address table blocked, and
+with a `Size` of 0 the first descriptor's table is still blocked. So are the TLS index slot and the
+security cookie with a TLS or load-configuration directory `Size` of 0, and the guard check pointer
+when the directory's `Size` covers it but the configuration's own `Size` field does not; a
+delay-import directory with a `Size` of 0 is refused. `apply_memory` runs against a fake process
+whose writes are counted: with a good first patch and a second one that differs in memory, nothing
+is written. With the test fault, apply and verify both refuse memory that differs from the expected
+bytes only in its first byte. A section whose file-backed bytes end exactly at `SizeOfImage` plans.
+A section at file offset 0x400 plans, and the same section moved to 0x410 is refused.
+
+On Windows, after the full build:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_patch_memory$' -V
+```
+
+`tests/startup_patch_memory_check.py` runs the debugger on `tests/startup_patch_probe.cpp`, which
+keeps a 16-byte marker in `.rdata`; its TLS callback copies the marker before `main` prints the copy
+and the live marker. Without a manifest both are original and the summary says `patches: none`.
+With a manifest that replaces 8 marker bytes, both show the replacement and the summary names the
+manifest, and `events.txt` shows the image file hashed through the CREATE_PROCESS handle before
+the write. A wrong `expect_sha256` or input hash exits 3 before the probe exists. Each test fault
+exits 3 with no probe output and no `patches: manifest` line. A copy of the probe whose first static
+import other than `kernel32.dll` names a DLL that does not exist is patched at process creation and
+then ended by the loader before its initial breakpoint (exit `0xc0000135`): its summary,
+`finished.txt` and `events.txt` say `patches: unverified manifest ...`. `launch.py` refuses the
+manifest, and a stale `X2W_DATA_PATCH_MAP` does not reach the probe. The check reads the loaded base
+from `events.txt`: on Windows the probe must be relocated (ASLR). A second build of the probe,
+`startup_patch_probe_low`, is linked at 0x7FFE0000, the shared user-data page, which is never free,
+so it is relocated on Windows and under Wine and must be patched there too. MSVC's linker may warn
+that this base is below 4 GB; that is the point of the target. The test is in the `pr` presets.
+
+Measured on the planner's earlier copy of the loader, before it moved onto `tools/patch_manifest.py`:
+the Linux check above with Python 3.13, and under Proton Wine the Windows check above, which passed
+on a clang-cl build of the probe. The patch line was logged before the first module load in
+`events.txt`, and with the patch moved to the loader breakpoint instead, the TLS copy showed the
+original bytes. The copy with a missing import was patched, ended by Wine's loader before the
+breakpoint and reported `patches: unverified`. Wine's CREATE_PROCESS event carries a file handle the
+debugger can read: the image hashed through it matched the gated EXE, and with the `image` fault the
+run was refused. Not measured: the Windows ordering, the missing-import case and the handle read on
+Windows, an EXE actually replaced between the gate and `CreateProcessW` (the fixture cannot time
+that), and Python older than 3.11.

@@ -1,7 +1,8 @@
 """Run one EXE in a kill-on-close job with a timeout, a commit cap and captured stdout/stderr.
 
 usage: launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--max-processes N] [-- args...]
-Prints the exit code (hex), how it ended and the trap log.
+Prints the exit code (hex), how it ended and the trap log. Patch manifests (X2W_PATCHES) are
+refused with exit code 3: tools/startup/debug_launch.py applies them.
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -9,6 +10,8 @@ import math
 import os
 import sys
 import time
+
+import patch_plan
 
 k32 = None
 if hasattr(ctypes, "WinDLL"):
@@ -248,6 +251,11 @@ def main(argv=None):
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    if os.environ.get(patch_plan.ENV):
+        # Only debug_launch.py applies (and reports) patch manifests; never run the title unpatched instead.
+        print("patches: refused: launch.py does not apply patch manifests; use debug_launch.py")
+        return 3
+
     if k32 is None:
         print("error: kernel32 is required to launch processes", file=sys.stderr)
         return 2
@@ -283,7 +291,7 @@ def main(argv=None):
         si.cb = ctypes.sizeof(si)
         si.dwFlags = 0x100  # STARTF_USESTDHANDLES
         si.hStdOutput, si.hStdError = out, err
-        env = dict(os.environ, X2W_TRAP_LOG=trap_log)
+        env = dict(patch_plan.child_env(os.environ), X2W_TRAP_LOG=trap_log)
         storage_note = prepare_storage_path(env, logdir)
         if storage_note:
             print(storage_note)

@@ -26,8 +26,8 @@ A manifest is TOML:
              { ext = ".cs.cso", file = "s001.cs.cso", sha256 = "<sha256>" }]
 
 The whole manifest is validated and the input's SHA-256 compared before anything is returned, so
-a manifest that fails any check applies nothing. The memory and shader kinds are defined, checked
-for shape only; nothing applies them yet.
+a manifest that fails any check applies nothing. The memory and shader kinds are defined and
+checked for shape only; tools/startup/patch_plan.py plans what its consumers apply.
 """
 
 import argparse

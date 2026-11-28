@@ -14,6 +14,14 @@ the budget up however long the run lasts; the first hit at one more site stops t
 stepped over when either budget allows it.
 A file named `stop` created in <logdir> during the run ends it as the timeout does (checked twice a
 second; a stop file left from an earlier run is removed at start).
+X2W_PATCHES=<manifest.toml>: stage 2 memory patches (tools/startup/patch_plan.py). The manifest
+is gated on this EXE's bytes and planned before the process exists. At the CREATE_PROCESS event,
+before any code of the process runs, the file the process was created from is hashed again through
+the event's file handle and must still be the manifest's input; then the patches are written. They
+are checked again at the loader breakpoint. Any refusal ends the run with exit code 3. The summary
+always has a `patches:` line; `patches: manifest ...` appears only after the loader-breakpoint check
+passed. Tests only: X2W_PATCH_TEST_FAULT=apply|verify|image shortens the read of that step by one
+byte (never the expected bytes).
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -36,6 +44,7 @@ from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritabl
 import host_cpu  # noqa: E402
 from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
 from window_capture import FILE_CAP, Series, png_bytes  # noqa: E402
+import patch_plan  # noqa: E402
 
 
 class MemoryBasicInformation(ctypes.Structure):
@@ -114,6 +123,27 @@ def read_stack(read, rsp, words):
     size = 8 * words
     data = read(rsp, size) or read(rsp, min(size, 0x1000 - (rsp & 0xfff))) or b""
     return data.ljust(size, b"\0")
+
+
+class Overlapped(ctypes.Structure):
+    _fields_ = [("Internal", ctypes.c_size_t), ("InternalHigh", ctypes.c_size_t), ("Offset", wt.DWORD),
+                ("OffsetHigh", wt.DWORD), ("hEvent", wt.HANDLE)]
+
+
+def file_reader(handle):
+    """read(offset, size) through a file handle for patch_plan.gate_image: b"" at the end of the file."""
+    def read(offset, size):
+        if not handle:
+            raise patch_plan.PatchError("the CREATE_PROCESS event has no file handle for the image")
+        buf, got = ctypes.create_string_buffer(size), wt.DWORD()
+        place = Overlapped(Offset=offset & 0xFFFFFFFF, OffsetHigh=offset >> 32)
+        if not k32.ReadFile(wt.HANDLE(handle), buf, size, ctypes.byref(got), ctypes.byref(place)):
+            error = ctypes.get_last_error()
+            if error == 38:  # ERROR_HANDLE_EOF
+                return b""
+            raise patch_plan.PatchError(f"cannot read the image the process was created from (error {error})")
+        return buf.raw[:got.value]
+    return read
 
 
 def final_path(handle):
@@ -195,6 +225,28 @@ def main():
     log_at = parse_log_at(os.environ.get("X2W_LOG_AT", ""), log)
     logged_hits = {}
 
+    def patches_refused(reason):
+        """Ends a run whose manifest was refused: exit code 3, never a partly patched or unpatched title."""
+        line = f"patches: refused: {reason}"
+        print(line)
+        log(line)
+        events.close()
+        with open(os.path.join(logdir, "finished.txt"), "w", encoding="utf-8") as handle:
+            handle.write("\n".join(summary) + "\n")
+        return 3
+
+    # Planned against the same EXE bytes the hash gate read, and before stdout.txt exists.
+    try:
+        patch_set, patch_plans = patch_plan.prepare(os.environ, exe)
+        patch_fault = patch_plan.test_fault(os.environ)
+    except patch_plan.PatchError as error:
+        return patches_refused(str(error))
+    if patch_set is None:
+        print(patch_plan.report_line(None))
+        log(patch_plan.report_line(None))
+    patch_refusal = None
+    patches_verified = False
+
     k32.SetErrorMode(0x8003)
     job = k32.CreateJobObjectW(None, None)
     info = EXTENDED_LIMIT()
@@ -209,7 +261,8 @@ def main():
     si.cb = ctypes.sizeof(si)
     si.dwFlags = 0x100
     si.hStdOutput, si.hStdError = out, err
-    env = dict(os.environ, X2W_TRAP_LOG=trap_log)
+    # A data-patch map or other launcher-only variable left in the shell never reaches the title.
+    env = dict(patch_plan.child_env(os.environ), X2W_TRAP_LOG=trap_log)
     # A process started under a debugger gets the debug heap: no low-fragmentation heap and checks on
     # every allocation and free. That multiplies the cost of each free, and a startup run frees a lot.
     # _NO_DEBUG_HEAP=1 keeps the ordinary heap; a caller who wants the checks sets _NO_DEBUG_HEAP=0.
@@ -271,6 +324,19 @@ def main():
         k32.VirtualProtectEx(wt.HANDLE(pi.hProcess), ctypes.c_void_p(addr), len(data), old.value, ctypes.byref(old))
         k32.FlushInstructionCache(wt.HANDLE(pi.hProcess), ctypes.c_void_p(addr), len(data))
         return ok
+
+    def patch_write(addr, data):
+        """write() for manifest patches: false when the protection change, the write (all bytes) or
+        the protection restore fails."""
+        buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+        old, ignored, written = wt.DWORD(), wt.DWORD(), ctypes.c_size_t()
+        if not k32.VirtualProtectEx(wt.HANDLE(pi.hProcess), ctypes.c_void_p(addr), len(data), 0x40, ctypes.byref(old)):
+            return False
+        ok = k32.WriteProcessMemory(wt.HANDLE(pi.hProcess), ctypes.c_void_p(addr), buf, len(data), ctypes.byref(written))
+        restored = k32.VirtualProtectEx(wt.HANDLE(pi.hProcess), ctypes.c_void_p(addr), len(data), old.value,
+                                        ctypes.byref(ignored))
+        k32.FlushInstructionCache(wt.HANDLE(pi.hProcess), ctypes.c_void_p(addr), len(data))
+        return bool(ok and written.value == len(data) and restored)
 
     def rewrite_for_host(address):
         """Rewrites the instruction at a faulting main-image address; returns its name, or None."""
@@ -955,8 +1021,27 @@ def main():
                 redirects[f"+{rva}"] = (int(nth or "1"), base + int(target, 16))
             modules[base] = os.path.basename(exe)
             log(f"{time.time() - start:7.3f} process {os.path.basename(exe)} at {base:#x}")
-            if h_file:
-                k32.CloseHandle(wt.HANDLE(h_file))
+            # No code of the process has run yet: not the loader's DLL initializers, not TLS callbacks.
+            try:
+                if patch_set is not None:
+                    # The gate read the EXE by path before CreateProcessW opened the path again; this reads the
+                    # file the process was created from, through the handle the event hands the debugger.
+                    image = file_reader(h_file)
+                    patch_plan.gate_image(patch_set, patch_plan.faulty_read(image)
+                                              if patch_fault == "image" else image)
+                    log(f"{time.time() - start:7.3f} patches: the process's image file is the manifest's input")
+                if patch_plans:
+                    patch_plan.apply_memory(patch_plans, base, patch_plan.faulty_read(read)
+                                                if patch_fault == "apply" else read, patch_write)
+            except patch_plan.PatchError as error:
+                patch_refusal = str(error)
+            finally:
+                if h_file:
+                    k32.CloseHandle(wt.HANDLE(h_file))
+            if patch_refusal is not None:
+                break
+            if patch_plans:
+                log(f"{time.time() - start:7.3f} patches: {len(patch_plans)} ranges written at process creation")
         elif code == LOAD_DLL:
             h_file, base = struct.unpack_from("<QQ", event, 16)
             name = final_path(h_file) if h_file else "?"
@@ -1056,6 +1141,20 @@ def main():
                 f"{'first' if first else 'second'}-chance params={[hex(p) for p in params]}")
             if ex_code == 0x80000003 and not loader_break_seen:
                 loader_break_seen = True  # the loader's initial breakpoint
+                if patch_plans:
+                    try:
+                        patch_plan.verify_applied(patch_plans, main_base, patch_plan.faulty_read(read)
+                                                      if patch_fault == "verify" else read, "at the loader breakpoint")
+                    except patch_plan.PatchError as error:
+                        patch_refusal = str(error)
+                        break
+                    patches_verified = True
+                    print(patch_plan.report_line(patch_set))
+                    log(f"{time.time() - start:7.3f} {patch_plan.report_line(patch_set)}")
+                    for addr in sorted(set(hooks) | {main_base + rva for rva in log_at}):
+                        inside = patch_plan.patch_at(patch_plans, addr - main_base)
+                        if inside:
+                            log(f"patches: breakpoint at +{addr - main_base:#x} is inside patch {inside}")
                 for addr in hooks:
                     arm(addr)
                 for rva in tuple(log_at):
@@ -1091,6 +1190,14 @@ def main():
         k32.ContinueDebugEvent(pid, tid, status)
 
     window.abandon()
+    if patch_refusal is not None:
+        k32.TerminateJobObject(wt.HANDLE(job), 3)
+        for h in (out, err, pi.hThread, pi.hProcess):
+            k32.CloseHandle(wt.HANDLE(h))
+        return patches_refused(patch_refusal)
+    if patch_plans and not patches_verified:
+        print(patch_plan.unverified_line(patch_set))
+        log(patch_plan.unverified_line(patch_set))
     elapsed = time.time() - start
     if stop and stop_at:
         dump_threads(os.path.join(logdir, "threads_stop.txt"))
