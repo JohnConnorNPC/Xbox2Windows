@@ -192,13 +192,15 @@ class PatchManifest(unittest.TestCase):
     def test_shader_patches(self):
         sha = self.digest
         ok = manifest_text(sha, self.original)
-        # Accepted beside a memory patch: each pipeline with its required files, mesh86 also with its pixel shader.
+        # Accepted beside a memory patch: each pipeline with its required files, mesh86 also with its pixel shader
+        # and compute also with its Python translator's HLSL.
         text = (ok + shader_patch("s001") + shader_patch("s002", "0123456789abcdef", "graphics")
                 + shader_patch("s003", "fedcba9876543210", "mesh86")
-                + shader_patch("s004", "0000000000000001", "mesh86", exts=(".mesh86.txt", ".ms.cso", ".ps.cso")))
+                + shader_patch("s004", "0000000000000001", "mesh86", exts=(".mesh86.txt", ".ms.cso", ".ps.cso"))
+                + shader_patch("s005", "0000000000000002", "compute", exts=(".txt", ".cs.cso", ".cs.hlsl")))
         target, patches = patch_manifest.parse(text)
         self.assertEqual([(p["id"], p["kind"]) for p in patches], [("p001", "memory")] + [
-            (pid, "shader") for pid in ("s001", "s002", "s003", "s004")])
+            (pid, "shader") for pid in ("s001", "s002", "s003", "s004", "s005")])
         s001 = patches[1]
         self.assertEqual((s001["key"], s001["pipeline"], s001["revision"]),
                          ("00c0ffee0badf00d", "compute", "x2w-startup-shader-12cs"))
@@ -206,11 +208,12 @@ class PatchManifest(unittest.TestCase):
             {"ext": ".txt", "file": "s001.txt", "sha256": hashlib.sha256(b"s001.txt").hexdigest()},
             {"ext": ".cs.cso", "file": "s001.cs.cso", "sha256": hashlib.sha256(b"s001.cs.cso").hexdigest()}])
         self.assertEqual([f["ext"] for f in patches[4]["files"]], [".mesh86.txt", ".ms.cso", ".ps.cso"])
+        self.assertEqual([f["ext"] for f in patches[5]["files"]], [".txt", ".cs.cso", ".cs.hlsl"])
         # The CLI lists shader ids with the memory ones.
         self.manifest.write_text(text, encoding="utf-8", newline="\n")
         result = self.cli(self.input)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["patch_ids"], ["p001", "s001", "s002", "s003", "s004"])
+        self.assertEqual(json.loads(result.stdout)["patch_ids"], ["p001", "s001", "s002", "s003", "s004", "s005"])
         good = shader_patch()
         cases = {
             "key must be 16 lowercase hex digits": ok + shader_patch(key="00c0ffee0badf00"),
@@ -231,7 +234,7 @@ class PatchManifest(unittest.TestCase):
             "files[0] has unknown keys: size": ok + good.replace('{ ext = ".txt",', '{ size = 1, ext = ".txt",'),
             "files[1] is missing: sha256": ok + good.replace(
                 f', sha256 = "{hashlib.sha256(b"s001.cs.cso").hexdigest()}"', ""),
-            "files[1] ext '.vs.cso' is not a compute translation file (.txt, .cs.cso)":
+            "files[1] ext '.vs.cso' is not a compute translation file (.txt, .cs.cso, .cs.hlsl)":
                 ok + shader_patch(exts=(".txt", ".vs.cso")),
             "s001 lists .txt twice": ok + shader_patch(exts=(".txt", ".cs.cso", ".txt")),
             "s001 compute override is missing: .cs.cso": ok + shader_patch(exts=(".txt",)),
@@ -288,7 +291,8 @@ class PatchManifest(unittest.TestCase):
 
     def test_shader_files_match_the_runtime(self):
         # The translation files each pipeline's loader in the runtime reads for one key: cache_path(..., L"", key, ext)
-        # and mesh86's load_stage(ext, ...). mesh86 reads its .ps.cso only for a request with a pixel shader.
+        # and mesh86's load_stage(ext, ...). mesh86 reads its .ps.cso only for a request with a pixel shader, and
+        # compute looks for its .cs.hlsl only when the .txt has no native line: neither is required.
         reads = re.compile(r'(?:cache_path\(\w+, L"", [\w.]+, |load_stage\()L"(\.[a-z0-9.]+)"')
         sources = {"graphics": "d3d12_draw.inl", "compute": "d3d12_compute_dispatch.inl", "mesh86": "mesh86_cache.inl"}
         self.assertEqual(set(sources), set(patch_manifest.PIPELINES))
@@ -300,6 +304,10 @@ class PatchManifest(unittest.TestCase):
         self.assertIn('(!request.ps.empty() && !load_stage(L".ps.cso", ps))', mesh86)
         self.assertEqual(set(patch_manifest.PIPELINES["mesh86"][1]) - set(patch_manifest.PIPELINES["mesh86"][2]),
                          {".ps.cso"})
+        compute = (ROOT / "src/startup_stubs/d3d12_compute_dispatch.inl").read_text(encoding="utf-8")
+        self.assertIn("if (output == x2w::NativeComputeOutput::unmarked) {", compute)
+        self.assertEqual(set(patch_manifest.PIPELINES["compute"][1]) - set(patch_manifest.PIPELINES["compute"][2]),
+                         {".cs.hlsl"})
 
     def test_deep_nesting_is_refused(self):
         def nested(depth):
