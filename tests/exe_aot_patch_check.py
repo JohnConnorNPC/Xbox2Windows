@@ -7,6 +7,9 @@ data that a range manifest binds. A patch manifest replaces the immediate with 0
 check that the patched copy is what gets translated, while the input hash, the range manifest and
 aot_source_sha256 still name the original input. A patch in zero bytes of .text that no function owns is
 reported as not lifted. The lifter writes the immediate as `0x1357ull`.
+A manifest that also carries a shader override converts with its memory patch applied and the
+override under `not_applied`; one of shader overrides only converts unpatched, says so and exports no
+patch provenance.
 
 Without CXX the cases translate only (Linux). With CXX (cl, as tools/exe_aot.py invokes it) the
 BuildTests also compile each conversion and run it: its exit code is the returned constant.
@@ -25,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "tools"), str(ROOT / "tests")]
 import cpu_stdio_exe_aot  # noqa: E402
 import exe_aot  # noqa: E402
+from startup import patch_plan  # noqa: E402
 import pefile  # noqa: E402
 from cpu_stdio_exe_aot_check import RAW_OFFSET, RDATA_RVA, SECTION_SIZE, TEXT_RVA, build_console_exe  # noqa: E402
 
@@ -176,7 +180,8 @@ class ConvertTests(unittest.TestCase):
         self.assertEqual(report["sha256"], sha256(raw))
         self.assertEqual(report["patches"], {"manifest": str(manifest.resolve()),
                                              "manifest_sha256": sha256(manifest.read_bytes()),
-                                             "active": ["imm"], "not_lifted": [], "patched_sha256": sha256(patched)})
+                                             "active": ["imm"], "not_lifted": [], "not_applied": [],
+                                             "patched_sha256": sha256(patched)})
         self.assertEqual(report["patch_line"], f"patches: manifest sha256={sha256(manifest.read_bytes())} active=imm")
         source = self.source.read_text(encoding="ascii")
         self.assertIn(REPLACEMENT_TEXT, source)
@@ -184,6 +189,40 @@ class ConvertTests(unittest.TestCase):
         for name, value in (("aot_patch_manifest_sha256", sha256(manifest.read_bytes())),
                             ("aot_patched_sha256", sha256(patched))):
             self.assertIn(f'extern "C" __declspec(dllexport) const char {name}[] = "{value}";', source)
+
+    def test_shader_patches_are_left_to_debug_launch(self):
+        raw, patched, meta = fixture("const")
+        shader = ('\n[[patch]]\nid = "s1"\nkind = "shader"\nkey = "0123456789abcdef"\npipeline = "compute"\n'
+                  f'revision = "{patch_plan.PIPELINES["compute"].revision}"\n'
+                  f'files = [{{ ext = ".txt", file = "s1.txt", sha256 = "{"a" * 64}" }}, '
+                  f'{{ ext = ".cs.cso", file = "s1.cso", sha256 = "{"b" * 64}" }}]\n'
+                  'why = "synthetic fixture"\nremove_when = "never"\n')
+        skipped = [{"id": "s1", "reason": "kind shader is applied by debug_launch.py"}]
+        mixed = write_manifest(self.dir / "mixed.toml", sha256(raw), [imm_patch(meta)])
+        mixed.write_text(mixed.read_text(encoding="utf-8") + shader, encoding="utf-8")
+        report = self.convert(self.image(raw), patches=mixed)
+        self.assertEqual(report["status"], "translated")
+        self.assertEqual((report["patches"]["active"], report["patches"]["not_applied"]), (["imm"], skipped))
+        self.assertEqual((report["patches"]["patched_sha256"], report["patch_line"]), (
+            sha256(patched), f"patches: manifest sha256={sha256(mixed.read_bytes())} active=imm not applied here: 1"))
+        source = self.source.read_text(encoding="ascii")
+        self.assertIn(REPLACEMENT_TEXT, source)
+        self.assertIn(f'const char aot_patch_manifest_sha256[] = "{sha256(mixed.read_bytes())}";', source)
+        # Shader patches only: the manifest is gated and accepted, nothing is applied and the line says so.
+        only = self.dir / "shader.toml"
+        only.write_text(f'[target]\ninput_sha256 = "{sha256(raw)}"\n' + shader, encoding="utf-8")
+        report = self.convert(self.image(raw), patches=only)
+        self.assertEqual(report["status"], "translated")
+        self.assertEqual((report["patches"]["active"], report["patches"]["not_applied"]), ([], skipped))
+        self.assertEqual((report["patches"]["patched_sha256"], report["patch_line"]), (
+            sha256(raw), f"patches: none active, manifest sha256={sha256(only.read_bytes())} not applied here: 1"))
+        source = self.source.read_text(encoding="ascii")
+        self.assertIn(ORIGINAL_TEXT, source)
+        self.assertNotIn("aot_patch", source)  # no active patch: no patch provenance exported
+        # Gated like any manifest: bound to another input, it is refused.
+        only.write_text(f'[target]\ninput_sha256 = "{sha256(patched)}"\n' + shader, encoding="utf-8")
+        report = self.convert(self.image(raw), patches=only)
+        self.assertEqual((report["status"], report["refusal"]["stage"]), ("refused", "patches"))
 
     def test_patch_outside_every_lifted_function_is_not_lifted(self):
         raw, patched, meta = fixture("const")

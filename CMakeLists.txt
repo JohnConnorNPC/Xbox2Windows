@@ -2403,6 +2403,11 @@ target_compile_features(startup_buffer_format_word3_check PRIVATE cxx_std_17)
 add_test(NAME startup_buffer_format_word3 COMMAND startup_buffer_format_word3_check)
 add_test(NAME startup_buffer_format_word3_mapping_control COMMAND startup_buffer_format_word3_check --mutate mapping)
 set_tests_properties(startup_buffer_format_word3_mapping_control PROPERTIES WILL_FAIL TRUE)
+# Which translation lookups a patch manifest's shader overrides redirect (src/startup_stubs/shader_override.h, #3037).
+add_executable(startup_shader_override_lookup_check tests/startup_shader_override_lookup_check.cpp)
+target_include_directories(startup_shader_override_lookup_check PRIVATE src)
+target_compile_features(startup_shader_override_lookup_check PRIVATE cxx_std_17)
+add_test(NAME startup_shader_override_lookup COMMAND startup_shader_override_lookup_check)
 # Acceleration-structure memory SRV validation for device slot 70 (src/startup_stubs/memory_srv_as.h); the
 # mutated runs are negative controls.
 add_executable(startup_memory_srv_as_check tests/startup_memory_srv_as_check.cpp)
@@ -4890,6 +4895,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_compute_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})
+        # A patch manifest's shader override served in place of the cached translation (#3037).
+        add_test(NAME startup_shader_override_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_shader_override_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+            "${DXC_EXECUTABLE}" ${adapter})
         add_test(NAME startup_compute_dispatch_texture_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_texture_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})
@@ -4919,6 +4928,7 @@ if(EXISTS "${INTAKE_PYTHON}")
             startup_compute_dispatch_heap_${adapter} startup_compute_dispatch_heap_word_${adapter}
             startup_compute_live_retry_${adapter} startup_compute_dispatch_entry_${adapter}
             startup_compute_dispatch_input_${adapter} startup_compute_dispatch_two_mips_${adapter}
+            startup_shader_override_${adapter}
             PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
     add_test(NAME startup_stream_adapter_filter COMMAND "${INTAKE_PYTHON}" -B

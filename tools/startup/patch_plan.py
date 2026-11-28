@@ -4,18 +4,23 @@ usage: patch_plan.py check|plan <manifest.toml> <input>
 
 tools/patch_manifest.py loads a manifest, checks its shape and gates it on its input's SHA-256. This
 module plans what that loader returns: `memory` patches, replacement bytes at an RVA of the loaded
-image (stage 2). tools/startup/debug_launch.py applies memory patches when X2W_PATCHES names a
-manifest: prepare() before the process exists; at its CREATE_PROCESS debug event gate_image() on the
-file the process was created from, then apply_memory(); verify_applied() again at the loader
-breakpoint.
+image (stage 2), and `shader` patches, the translation files of one shader cache key, read by the
+runtime in place of the shader cache's. tools/startup/debug_launch.py applies a manifest when
+X2W_PATCHES names one: prepare() and plan_shaders() before the process exists, materialize_shaders()
+into the run's log directory (named to the child in X2W_PATCH_SHADER_DIR); at its CREATE_PROCESS
+debug event gate_image() on the file the process was created from, then apply_memory();
+verify_applied() again at the loader breakpoint.
 
 Every loader refusal is raised here as a PatchError with the loader's reason. On top of the loader's
 rules a manifest is refused here when an id does not match [a-z0-9][a-z0-9._-]{0,63} (the run summary
-joins ids with commas), when it has a patch kind other than memory, when one memory patch replaces
-more than MAX_BYTES bytes, or when it has more than MAX_PATCHES patches.
+joins ids with commas), when it has a patch kind other than memory and shader, when one memory patch
+replaces more than MAX_BYTES bytes, when it has more than MAX_PATCHES patches, when a shader patch's
+revision is not the runtime's current one for its pipeline, or when it lists a file the planner does
+not plan (PIPELINES).
 
 `check` (load + hash gate) prints `patches: ok manifest sha256=<hex> patches=<n>` and exits 0;
-`plan` also plans every memory patch against the input PE and adds ` planned`. A refusal prints
+`plan` also plans every memory patch against the input PE, reads and hashes every shader file
+and adds ` planned`. A refusal prints
 `patches: refused: <reason>` and exits 3. Usage errors exit 2. A manifest is accepted whole or
 refused whole: one bad patch refuses all of them.
 
@@ -25,6 +30,7 @@ import dataclasses
 import hashlib
 import os
 import re
+import stat
 import struct
 import sys
 
@@ -40,6 +46,11 @@ MAX_PATCHES = 4096
 ENV = "X2W_PATCHES"
 CHILD_ONLY = ("X2W_DATA_PATCH_MAP",)
 CHILD_ONLY_PREFIX = "X2W_PATCH_"
+# The directory of materialized shader overrides; under CHILD_ONLY_PREFIX, so a stale value is dropped.
+SHADER_DIR_ENV = "X2W_PATCH_SHADER_DIR"
+# cache_path writes "<dir>\\<16 hex><ext>" into a MAX_PATH (260) wchar_t buffer: 1 + 16 + len(".mesh86.txt") + NUL.
+# Counted in UTF-16 units, as that buffer counts them: a character outside the BMP takes two.
+SHADER_DIR_MAX = 260 - 1 - 16 - 11 - 1
 # Tests only: X2W_PATCH_TEST_FAULT=apply|verify|image shortens the read of that step (see faulty_read).
 TEST_FAULT = "X2W_PATCH_TEST_FAULT"
 TEST_FAULTS = ("apply", "verify", "image")
@@ -53,6 +64,28 @@ class PatchError(Exception):
 
 
 @dataclasses.dataclass(frozen=True)
+class Pipeline:
+    revision: str  # the runtime's key revision: a new revision changes every key, so overrides stop matching
+    caps: dict  # every file the planner plans for a key -> the largest the runtime accepts
+
+
+# What the runtime reads for one key with cache_path(..., L"", key, ext). The revisions are the literals
+# in src/startup_stubs/d3d12_draw.inl (graphics `revision`, `compute_revision`) and mesh86_cache.inl;
+# tests/patch_plan_check.py pins them. The loader (tools/patch_manifest.py PIPELINES) checks each
+# revision's form and the files each pipeline requires; tests/patch_plan_check.py pins that these
+# pipelines are its pipelines and these files a subset of its files. compute's .cs.hlsl, which the
+# loader allows, is not planned. mesh86 refuses a marker over 96 bytes and a stage over 1 MiB.
+SHADER_CAP = 16 << 20
+PIPELINES = {
+    "graphics": Pipeline("x2w-startup-shader-29", {".txt": SHADER_CAP, ".vs.cso": SHADER_CAP, ".ps.cso": SHADER_CAP}),
+    "compute": Pipeline("x2w-startup-shader-29cs", {".txt": SHADER_CAP, ".cs.cso": SHADER_CAP}),
+    "mesh86": Pipeline("x2w-startup-mesh-86-1", {".mesh86.txt": 96, ".ms.cso": 1 << 20, ".ps.cso": 1 << 20}),
+}
+SHADER_NAME_RE = re.compile(r"[0-9a-f]{16}(?:%s)\Z" % "|".join(
+    sorted({re.escape(ext) for p in PIPELINES.values() for ext in p.caps}, key=len, reverse=True)))
+
+
+@dataclasses.dataclass(frozen=True)
 class Patch:
     id: str
     kind: str  # "memory"
@@ -61,6 +94,32 @@ class Patch:
     rva: int
     expect_sha256: str  # lowercase hash of the len(data) original bytes at rva
     data: bytes  # the replacement, written as `bytes`
+
+
+@dataclasses.dataclass(frozen=True)
+class ShaderFile:
+    ext: str
+    path: str  # absolute; `file` resolved against the manifest's directory
+    sha256: str  # lowercase
+
+
+@dataclasses.dataclass(frozen=True)
+class ShaderPatch:
+    id: str
+    kind: str  # "shader"
+    why: str
+    remove_when: str
+    key: str  # 16 lowercase hex digits, as the runtime formats a cache key
+    pipeline: str
+    revision: str
+    files: tuple  # ShaderFile, in manifest order
+
+
+@dataclasses.dataclass(frozen=True)
+class ShaderPlan:
+    id: str
+    key: str
+    files: tuple  # (ext, sha256, bytes) per file, the bytes read and hashed once
 
 
 @dataclasses.dataclass(frozen=True)
@@ -100,11 +159,15 @@ def load(path, data):
     entries = bound["patches"]
     if len(entries) > MAX_PATCHES:
         raise PatchError(f"{len(entries)} [[patch]] entries, more than {MAX_PATCHES}")
+    base = os.path.dirname(os.path.abspath(path))
     patches = []
     for entry in entries:
         if not ID_RE.match(entry["id"]):
             raise PatchError(f"patch {entry['id']!r}: id must match [a-z0-9][a-z0-9._-]{{0,63}}")
         where = f"patch {entry['id']}"
+        if entry["kind"] == "shader":
+            patches.append(_shader(where, entry, base))
+            continue
         if entry["kind"] != "memory":
             raise PatchError(f"{where}: kind \"{entry['kind']}\" has no consumer in the startup debugger")
         if len(entry["bytes"]) > MAX_BYTES:
@@ -113,6 +176,24 @@ def load(path, data):
                              rva=entry["rva"], expect_sha256=entry["expect_sha256"], data=entry["bytes"]))
     return Manifest(path=os.path.abspath(path), sha256=bound["manifest_sha256"], input_sha256=bound["input_sha256"],
                     patches=tuple(patches))
+
+
+def _shader(where, entry, base):
+    """A ShaderPatch from the loader's shader entry: its revision must be the runtime's current one, and each file
+    one the planner plans; `file` (a bare name, the loader checked) is resolved against the manifest's directory."""
+    name = entry["pipeline"]
+    pipeline = PIPELINES[name]
+    if entry["revision"] != pipeline.revision:
+        raise PatchError(f"{where}: revision {entry['revision']!r} is not the runtime's {name} key revision "
+                         f"{pipeline.revision}")
+    files = []
+    for item in entry["files"]:
+        if item["ext"] not in pipeline.caps:
+            raise PatchError(f"{where}: ext {item['ext']!r} is not a {name} file the planner plans "
+                             f"({', '.join(pipeline.caps)})")
+        files.append(ShaderFile(item["ext"], os.path.join(base, item["file"]), item["sha256"]))
+    return ShaderPatch(id=entry["id"], kind="shader", why=entry["why"], remove_when=entry["remove_when"],
+                       key=entry["key"], pipeline=name, revision=entry["revision"], files=tuple(files))
 
 
 def _read_input(input_path):
@@ -271,11 +352,12 @@ def plan_memory(manifest, data):
     min(VirtualSize, SizeOfRawData))), must not touch a base relocation or a loader-written slot, and
     the input's bytes there must hash to expect_sha256. The loader has refused patches that overlap
     each other and ranges that end past 2**32; parse_pe refuses sections that end past SizeOfImage, and
-    ends are Python integers, so a range cannot wrap."""
+    ends are Python integers, so a range cannot wrap. Patches of other kinds are not planned here."""
+    memory = tuple(p for p in manifest.patches if p.kind == "memory")
     image = parse_pe(data)
     blocked = relocation_ranges(data, image) + loader_written_ranges(data, image)
     first_va = image.sections[0].va if image.sections else image.size_of_image
-    for patch in manifest.patches:
+    for patch in memory:
         start, end = patch.rva, patch.rva + len(patch.data)
         where = f"patch {patch.id}: range {start:#x}-{end:#x}"
         section = next((s for s in image.sections if s.va <= start < s.end), None)
@@ -294,19 +376,89 @@ def plan_memory(manifest, data):
         offset = section.raw + start - section.va
         if hashlib.sha256(data[offset:offset + len(patch.data)]).hexdigest() != patch.expect_sha256:
             raise PatchError(f"patch {patch.id}: the input's bytes at {start:#x} do not match expect_sha256")
-    return manifest.patches
+    return memory
 
 
 def prepare(environ, exe_path):
     """(manifest, plans) for the EXE the launcher starts, or (None, ()) without X2W_PATCHES.
 
-    The EXE is read once: the hash gate and the plan use the same bytes."""
+    The EXE is read once: the hash gate and the plan use the same bytes. A manifest without memory
+    patches is gated only: its plans are () and the EXE is not parsed as a PE."""
     path = environ.get(ENV)
     if not path:
         return None, ()
     data = _read_input(exe_path)
     manifest = load(path, data)
+    if not any(p.kind == "memory" for p in manifest.patches):
+        return manifest, ()
     return manifest, plan_memory(manifest, data)
+
+
+def plan_shaders(manifest):
+    """A ShaderPlan per shader patch of manifest (None: no manifest), or PatchError.
+
+    Each file must be a non-empty regular file of at most its extension's cap (PIPELINES) whose
+    bytes hash to its sha256. The bytes are read once; materialize_shaders writes these bytes."""
+    plans = []
+    for patch in manifest.patches if manifest else ():
+        if patch.kind != "shader":
+            continue
+        caps = PIPELINES[patch.pipeline].caps
+        files = []
+        for item in patch.files:
+            where = f"patch {patch.id}: {item.ext} file {item.path}"
+            cap = caps[item.ext]
+            try:
+                info = os.stat(item.path)
+                if not stat.S_ISREG(info.st_mode):
+                    raise PatchError(f"{where} is not a regular file")
+                with open(item.path, "rb") as handle:
+                    data = handle.read(cap + 1)
+            except OSError as error:
+                raise PatchError(f"{where}: cannot read it: {error.strerror or error}") from None
+            if not data:
+                raise PatchError(f"{where} is empty")
+            if len(data) > cap:
+                raise PatchError(f"{where} has more than {cap} bytes, the most the runtime reads")
+            if hashlib.sha256(data).hexdigest() != item.sha256:
+                raise PatchError(f"{where} does not match its sha256")
+            files.append((item.ext, item.sha256, data))
+        plans.append(ShaderPlan(patch.id, patch.key, tuple(files)))
+    return tuple(plans)
+
+
+def materialize_shaders(plans, directory):
+    """Writes every planned file as <directory>/<key><ext> and returns the absolute directory, or None
+    without plans. The directory is created, or emptied of override names left by an earlier run;
+    anything else in it refuses. Each copy is read back and must hash to the manifest's sha256. The
+    runtime reads these copies and nothing checks them again during the run: the directory must not
+    change while the title runs."""
+    if not plans:
+        return None
+    directory = os.path.abspath(directory)
+    units = len(directory.encode("utf-16-le", "surrogatepass")) // 2
+    if units > SHADER_DIR_MAX:
+        raise PatchError(f"the shader override directory path has {units} UTF-16 units; "
+                         f"the runtime takes at most {SHADER_DIR_MAX}")
+    try:
+        os.makedirs(directory, exist_ok=True)
+        for name in sorted(os.listdir(directory)):
+            path = os.path.join(directory, name)
+            if not SHADER_NAME_RE.match(name) or os.path.islink(path) or not os.path.isfile(path):
+                raise PatchError(f"the shader override directory holds {name}, which is not an override file")
+            os.remove(path)
+        for plan in plans:
+            for ext, _, data in plan.files:
+                with open(os.path.join(directory, plan.key + ext), "wb") as handle:
+                    handle.write(data)
+        for plan in plans:
+            for ext, sha256, _ in plan.files:
+                with open(os.path.join(directory, plan.key + ext), "rb") as handle:
+                    if hashlib.sha256(handle.read()).hexdigest() != sha256:
+                        raise PatchError(f"patch {plan.id}: the copy of its {ext} file does not match its sha256")
+    except OSError as error:
+        raise PatchError(f"cannot write the shader override directory: {error.strerror or error}") from None
+    return directory
 
 
 def gate_image(manifest, read):
@@ -379,16 +531,42 @@ def patch_at(plans, rva):
 
 
 def report_line(manifest):
-    """The run summary's patch line."""
+    """The run summary's patch line: `active=` names the memory patches (written), `offered=` the shader
+    overrides (handed to the child; found_line says which the stand-in found at their lookup)."""
     if manifest is None:
         return "patches: none"
-    return f"patches: manifest sha256={manifest.sha256} active={','.join(p.id for p in manifest.patches)}"
+    line = f"patches: manifest sha256={manifest.sha256}"
+    for label, kind in (("active", "memory"), ("offered", "shader")):
+        ids = [p.id for p in manifest.patches if p.kind == kind]
+        if ids:
+            line += f" {label}={','.join(ids)}"
+    return line
+
+
+# The stand-in's line for a translation file of an overridden key that was in the override directory at its first
+# lookup (d3d12_draw.inl, cache_path).
+FOUND_RE = re.compile(r"x2w-patch shader ([0-9a-f]{16}) found (\S+)")
+
+
+def found_line(plans, log_text):
+    """The run summary's lookup line: an offered override (ShaderPlan) counts as found when the stand-in's log has
+    `x2w-patch shader <key> found <ext>` for its key, that is when one of its files was in the directory when the
+    runtime looked it up. It does not show that a translation was loaded or used: a file the runtime then refuses,
+    or a key whose pipeline needs a file the override lacks, still counts. Lines of other keys are not counted."""
+    found = {match.group(1) for match in FOUND_RE.finditer(log_text)}
+    hit = [plan.id for plan in plans if plan.key in found]
+    missed = [plan.id for plan in plans if plan.key not in found]
+    return (f"patches: shader overrides found {len(hit)} of {len(plans)}: found={','.join(hit) or '-'} "
+            f"not_found={','.join(missed) or '-'}")
 
 
 def unverified_line(manifest):
-    """The summary line when patches were written but the process ended before the loader breakpoint."""
-    return (f"patches: unverified manifest sha256={manifest.sha256} active={','.join(p.id for p in manifest.patches)} "
-            f"(written; the process ended before the loader-breakpoint re-check)")
+    """The summary line when memory patches were written but the process ended before the loader
+    breakpoint: report_line's ids (active= memory, offered= shader) marked unverified."""
+    return (report_line(manifest).replace("patches: manifest ", "patches: unverified manifest ", 1)
+            + " (written; the process ended before the loader-breakpoint re-check)")
+
+
 
 
 def child_env(environ):
@@ -411,6 +589,7 @@ def main(argv):
     try:
         if argv[1] == "plan":
             manifest, _ = prepare({ENV: argv[2]}, argv[3])
+            plan_shaders(manifest)
         else:
             manifest = check(argv[2], argv[3])
     except PatchError as error:

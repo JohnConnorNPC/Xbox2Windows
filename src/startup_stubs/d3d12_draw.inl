@@ -246,8 +246,18 @@ u64 fnv_bytes(const void* data, std::size_t bytes, u64 hash = 146959810393466560
     return hash;
 }
 
+// A translation file of a key a patch manifest overrides comes from X2W_PATCH_SHADER_DIR only, never from the
+// shader cache (src/startup_stubs/shader_override.h decides, once per key; docs/experiments/patch-manifests.md).
 bool cache_path(wchar_t* out, const wchar_t* prefix, u64 key, const wchar_t* extension)
 {
+    if (!*prefix) {  // a translation file; request files (prefix "req_") always use the cache
+        static x2w_startup::ShaderOverrides overrides;
+        const x2w_startup::ShaderOverrideLookup found = overrides.lookup(out, key, extension);
+        if (found.log_unusable) log("x2w-patch shader directory does not fit MAX_PATH: every translation refused");
+        if (found.log_found) log("x2w-patch shader %016llx found %ls", key, extension);
+        if (found.log_missing) log("x2w-patch shader %016llx has no %ls, not taken from the cache", key, extension);
+        if (found.result != x2w_startup::ShaderOverride::none) return found.result == x2w_startup::ShaderOverride::overridden;
+    }
     wchar_t dir[MAX_PATH];
     const DWORD n = GetEnvironmentVariableW(L"X2W_SHADER_CACHE", dir, MAX_PATH);
     if (!n || n >= MAX_PATH) return false;

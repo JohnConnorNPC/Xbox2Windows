@@ -4,8 +4,9 @@ The stages run in order: header, imports, patches, translate, build. Each profil
 shared lifter can bind for a whole program. The first profile that binds every import is translated. With
 --patches, a patch manifest bound to the input (docs/experiments/patch-manifests.md) is planned against the
 input bytes and applied to a copy, and the copy is translated; the report's sha256, a --bind-ranges range
-manifest and aot_source_sha256 still name the original input. The report's patches.active names the patches
-the translator read, and not_lifted the rest (split_lifted). A refusal names its stage, the first refused RVA when the lifter gives one, and every import without a binding.
+manifest and aot_source_sha256 still name the original input. The report's patches.active names the memory
+patches the translator read, not_lifted the rest (split_lifted), and not_applied the patches of other kinds.
+A refusal names its stage, the first refused RVA when the lifter gives one, and every import without a binding.
 OUT_DIR/report.json is written for every outcome. Generated files are named <stem>_aot.cpp and
 <stem>_aot.exe; stale copies from an earlier run are removed first.
 """
@@ -37,6 +38,8 @@ OPTIONAL_IMPORTS = {cpu_stdio_exe_aot.STARTUP_ONLY}
 # planned and reported but could not change the output, so it is refused.
 CODE_ONLY_PROFILES = {"console-stdio"}
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
+# Patch kinds a manifest may carry for another consumer: the converter gates and accepts them, applies none.
+NOT_APPLIED = {"shader": "kind shader is applied by debug_launch.py"}
 NOT_LIFTED = "the translator read no byte of its range (outside every lifted function)"
 FIRST_RVA = re.compile(r"\bRVA (0x[0-9a-f]+)")
 CXX_FLAGS = ("/nologo", "/std:c++17", "/O2", "/MT", "/EHsc")
@@ -78,12 +81,14 @@ def read_header(data):
 
 
 def apply_patches(manifest_path, data, profile):
-    """(manifest, patched copy of data) for a patch manifest bound to data, the one read of the input.
+    """(manifest, applied memory patches, patched copy of data) for a patch manifest bound to data, the
+    one read of the input.
 
     tools/startup/patch_plan.py loads the manifest gated on data (tools/patch_manifest.py's load_data), so its
     input_sha256 must be the SHA-256 of data, and plans every memory patch against data; in a code-only profile
     each range must lie in an executable section. The replacements are written into a copy at their file
-    offsets. Raises Refusal("patches")."""
+    offsets. Patches of other kinds (NOT_APPLIED) are for other consumers of the same manifest and are not
+    applied here. Raises Refusal("patches")."""
     try:
         manifest = patch_plan.load(manifest_path, data)
         plans = patch_plan.plan_memory(manifest, data)
@@ -105,7 +110,7 @@ def apply_patches(manifest_path, data, profile):
             patched[offset:offset + len(patch.data)] = patch.data
     except patch_plan.PatchError as exc:
         raise Refusal("patches", str(exc)) from exc
-    return manifest, bytes(patched)
+    return manifest, plans, bytes(patched)
 
 
 def split_lifted(patches, reads):
@@ -127,10 +132,13 @@ def split_lifted(patches, reads):
     return active, not_lifted
 
 
-def converter_patch_line(manifest, active, not_lifted):
-    """The conversion's patch line: active= names the patches the translator read, and `not lifted: <n>`
-    counts the rest. Without an active patch the line does not start with `patches: manifest`."""
-    tail = f" not lifted: {len(not_lifted)}" if not_lifted else ""
+def converter_patch_line(manifest, active, not_lifted, skipped):
+    """The conversion's patch line: active= names the memory patches the translator read, `not lifted: <n>`
+    counts the memory patches it did not read, and `not applied here: <n>` the patches left to another
+    consumer. Without an active patch the line does not start with `patches: manifest`, and it never says
+    `offered=`: the converter serves nothing."""
+    tail = (f" not lifted: {len(not_lifted)}" if not_lifted else "") + (
+        f" not applied here: {len(skipped)}" if skipped else "")
     if not active:
         return f"patches: none active, manifest sha256={manifest.sha256}{tail}"
     return f"patches: manifest sha256={manifest.sha256} active={','.join(patch.id for patch in active)}{tail}"
@@ -273,7 +281,8 @@ def convert(image, out_dir, *, entry_export=None, cxx=None, compile_exe=True, pa
         bindings, host, translate = PROFILES[profile]
         lifted = data
         if patches is not None:
-            manifest, lifted = apply_patches(patches, data, profile)
+            manifest, applied, lifted = apply_patches(patches, data, profile)
+            skipped = [patch for patch in manifest.patches if patch.kind in NOT_APPLIED]
         ranges = None  # read once here and checked with cpu_switch_aot.load_bindings, as the translator reads it
         if bind_ranges is not None:
             try:
@@ -291,12 +300,14 @@ def convert(image, out_dir, *, entry_export=None, cxx=None, compile_exe=True, pa
             match = FIRST_RVA.search(str(exc))
             raise Refusal("translate", str(exc), rva=match and match.group(1)) from exc
         if patches is not None:
-            active, not_lifted = split_lifted(manifest.patches, reads)
+            active, not_lifted = split_lifted(applied, reads)
             report["patches"] = {"manifest": manifest.path, "manifest_sha256": manifest.sha256,
                                  "active": [patch.id for patch in active],
                                  "not_lifted": [{"id": patch.id, "reason": NOT_LIFTED} for patch in not_lifted],
+                                 "not_applied": [{"id": patch.id, "reason": NOT_APPLIED[patch.kind]}
+                                                 for patch in skipped],
                                  "patched_sha256": hashlib.sha256(lifted).hexdigest()}
-            report["patch_line"] = converter_patch_line(manifest, active, not_lifted)
+            report["patch_line"] = converter_patch_line(manifest, active, not_lifted, skipped)
             if active:  # otherwise the source is the original's translation: no patch provenance
                 text += patch_provenance(report)
         _atomic_write_text(source, text, encoding="ascii")

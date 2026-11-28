@@ -275,7 +275,7 @@ class PatchManifest(unittest.TestCase):
 
     def test_shader_revision_forms_match_the_runtime(self):
         # The runtime's current revision of each pipeline has the loader's form, so a bump (a new <n>) still loads.
-        # Whether a manifest names the current revision is for a later consumer to check against the runtime.
+        # Whether a manifest names the current revision is for tools/startup/patch_plan.py to check against the runtime.
         draw = (ROOT / "src/startup_stubs/d3d12_draw.inl").read_text(encoding="utf-8")
         mesh86 = (ROOT / "src/startup_stubs/mesh86_cache.inl").read_text(encoding="utf-8")
         found = {

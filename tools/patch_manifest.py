@@ -49,7 +49,7 @@ COMMON = {"id", "kind", "why", "remove_when"}
 KINDS = {"memory": {"rva", "expect_sha256", "bytes"}, "shader": {"key", "pipeline", "revision", "files"}}
 # Shader patches, per pipeline: the form of the runtime's key revision (src/startup_stubs/d3d12_draw.inl and
 # mesh86_cache.inl; <n> is the number each revision bump raises), the translation files the runtime reads for one
-# key, and the ones without which it has no translation. A later consumer must check which is current. compute
+# key, and the ones without which it has no translation. tools/startup/patch_plan.py checks which is current. compute
 # also needs .cs.hlsl when its .txt has no native line, and mesh86 reads .ps.cso only for a request with a pixel
 # shader; this loader reads neither, so both stay optional.
 PIPELINES = {
@@ -83,10 +83,11 @@ def _sha256(value, where):
 
 
 def _file_name(value, where):
-    """A bare file name, for a later consumer to resolve in the manifest's directory.
+    """A bare file name, for the consumer (tools/startup/patch_plan.py) to resolve in the manifest's directory.
 
-    That consumer is the runtime, which runs on Windows, so a name that Windows would not resolve to a file of that
-    name in the directory is refused too: one it cannot hold, one whose trailing dot or space it drops, a device.
+    It reads the files under the startup debugger, which runs on Windows, so a name that Windows would not resolve to
+    a file of that name in the directory is refused too: one it cannot hold, one whose trailing dot or space it drops,
+    a device.
     """
     name = _text(value, where)
     if any(c in name for c in "/\\:") or name in (".", ".."):

@@ -1,7 +1,9 @@
 // Input for tests/startup_patch_memory_check.py (stage 2 memory patches; docs/experiments/patch-manifests.md).
 // x2w_patch_marker is a 16-byte array in .rdata. A TLS callback, the first code of this image that the
 // loader runs, copies it at DLL_PROCESS_ATTACH. main then prints that copy and the live array as hex,
-// and whether X2W_DATA_PATCH_MAP reached the process, and exits 0. No other input is involved.
+// and whether X2W_DATA_PATCH_MAP reached the process, and exits 0. When X2W_PATCH_SHADER_DIR is set (by
+// tools/startup/debug_launch.py for a manifest's shader overrides; tests/startup_patch_shader_launch_check.py)
+// it also prints that directory; without it the output is unchanged. No other input is involved.
 #include <windows.h>
 
 #include <cstdio>
@@ -48,6 +50,10 @@ int main()
     print_hex("live", x2w_patch_marker);
     const bool map = GetEnvironmentVariableA("X2W_DATA_PATCH_MAP", nullptr, 0) != 0;
     std::printf("patch-probe data-patch map %s\n", map ? "present" : "absent");
+    char shader_dir[MAX_PATH];
+    const DWORD length = GetEnvironmentVariableA("X2W_PATCH_SHADER_DIR", shader_dir, MAX_PATH);
+    if (length)
+        std::printf("patch-probe shader dir %s\n", length < MAX_PATH ? shader_dir : "(longer than MAX_PATH)");
     std::fflush(stdout);
     return 0;
 }

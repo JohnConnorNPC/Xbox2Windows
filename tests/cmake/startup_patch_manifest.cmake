@@ -1,6 +1,7 @@
 # Stage 2 memory patches (#3037; docs/experiments/patch-manifests.md): tools/startup/debug_launch.py writes a
 # manifest's patches into a source-built probe before the probe's TLS callback runs, reports them in the
 # summary, and exits 3 for a wrong expect_sha256 or input hash or a test fault; launch.py refuses manifests.
+# The same probe shows the directory of shader overrides the debugger hands the child (X2W_PATCH_SHADER_DIR).
 if(EXISTS "${INTAKE_PYTHON}")
     # The planner (tools/startup/patch_plan.py) on synthetic inputs; pure Python, also in the Linux job.
     add_test(NAME patch_plan_controls COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/patch_plan_check.py")
@@ -15,4 +16,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/startup_patch_memory_check.py" "$<TARGET_FILE:startup_patch_probe>"
         "$<TARGET_FILE:startup_patch_probe_low>")
     set_tests_properties(startup_patch_memory PROPERTIES TIMEOUT 300)
+    add_test(NAME startup_patch_shader_launch COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_patch_shader_launch_check.py" "$<TARGET_FILE:startup_patch_probe>")
+    set_tests_properties(startup_patch_shader_launch PROPERTIES TIMEOUT 300)
 endif()

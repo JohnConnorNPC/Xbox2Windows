@@ -14,14 +14,19 @@ the budget up however long the run lasts; the first hit at one more site stops t
 stepped over when either budget allows it.
 A file named `stop` created in <logdir> during the run ends it as the timeout does (checked twice a
 second; a stop file left from an earlier run is removed at start).
-X2W_PATCHES=<manifest.toml>: stage 2 memory patches (tools/startup/patch_plan.py). The manifest
-is gated on this EXE's bytes and planned before the process exists. At the CREATE_PROCESS event,
-before any code of the process runs, the file the process was created from is hashed again through
-the event's file handle and must still be the manifest's input; then the patches are written. They
-are checked again at the loader breakpoint. Any refusal ends the run with exit code 3. The summary
-always has a `patches:` line; `patches: manifest ...` appears only after the loader-breakpoint check
-passed. Tests only: X2W_PATCH_TEST_FAULT=apply|verify|image shortens the read of that step by one
-byte (never the expected bytes).
+X2W_PATCHES=<manifest.toml>: stage 2 memory patches and shader overrides
+(tools/startup/patch_plan.py). The manifest is gated on this EXE's bytes and planned before the
+process exists. At the CREATE_PROCESS event, before any code of the process runs, the file the
+process was created from is hashed again through the event's file handle and must still be the
+manifest's input; then the memory patches are written. They are checked again at the loader
+breakpoint. Shader overrides are read, hashed, copied to <logdir>/patch_shaders and hashed again
+before the process exists (not again during the run); only then does the child get
+X2W_PATCH_SHADER_DIR=<that directory>. Any refusal ends the run with exit code 3. The summary
+always has a `patches:` line. With memory patches, `patches: manifest ...` appears only after the
+loader-breakpoint check passed; with shader overrides only, at the CREATE_PROCESS event, after the
+image hash. With shader overrides the summary ends with the ones the stand-in logged as found
+at their lookup. Tests only: X2W_PATCH_TEST_FAULT=apply|verify|image shortens the read of that
+step by one byte (never the expected bytes).
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -235,15 +240,20 @@ def main():
             handle.write("\n".join(summary) + "\n")
         return 3
 
-    # Planned against the same EXE bytes the hash gate read, and before stdout.txt exists.
+    # Planned against the same EXE bytes the hash gate read, and before stdout.txt exists. The runtime
+    # reads the shader override copies in the log directory, which are hashed after the copy.
     try:
         patch_set, patch_plans = patch_plan.prepare(os.environ, exe)
         patch_fault = patch_plan.test_fault(os.environ)
+        shader_plans = patch_plan.plan_shaders(patch_set)
+        shader_dir = patch_plan.materialize_shaders(shader_plans, os.path.join(logdir, "patch_shaders"))
     except patch_plan.PatchError as error:
         return patches_refused(str(error))
     if patch_set is None:
         print(patch_plan.report_line(None))
         log(patch_plan.report_line(None))
+    if shader_dir:
+        log(f"patches: shader overrides for {len(shader_plans)} keys in {shader_dir}")
     patch_refusal = None
     patches_verified = False
 
@@ -263,6 +273,8 @@ def main():
     si.hStdOutput, si.hStdError = out, err
     # A data-patch map or other launcher-only variable left in the shell never reaches the title.
     env = dict(patch_plan.child_env(os.environ), X2W_TRAP_LOG=trap_log)
+    if shader_dir:
+        env[patch_plan.SHADER_DIR_ENV] = shader_dir
     # A process started under a debugger gets the debug heap: no low-fragmentation heap and checks on
     # every allocation and free. That multiplies the cost of each free, and a startup run frees a lot.
     # _NO_DEBUG_HEAP=1 keeps the ordinary heap; a caller who wants the checks sets _NO_DEBUG_HEAP=0.
@@ -1041,7 +1053,15 @@ def main():
             if patch_refusal is not None:
                 break
             if patch_plans:
-                log(f"{time.time() - start:7.3f} patches: {len(patch_plans)} ranges written at process creation")
+                written = f"patches: {len(patch_plans)} ranges written at process creation"
+                if shader_plans:
+                    written += f"; {len(shader_plans)} shader overrides"
+                log(f"{time.time() - start:7.3f} {written}")
+            elif patch_set is not None:
+                # Shader overrides only: nothing to write or check again; the child had them before it existed.
+                print(patch_plan.report_line(patch_set))
+                log(f"{time.time() - start:7.3f} {patch_plan.report_line(patch_set)} "
+                    f"(at process creation: no memory patches; {len(shader_plans)} shader overrides)")
         elif code == LOAD_DLL:
             h_file, base = struct.unpack_from("<QQ", event, 16)
             name = final_path(h_file) if h_file else "?"
@@ -1335,6 +1355,15 @@ def main():
     k32.TerminateJobObject(wt.HANDLE(job), 0xDEAD0002)
     for h in (out, err, pi.hThread, pi.hProcess):
         k32.CloseHandle(wt.HANDLE(h))
+    if shader_plans:
+        # offered= names what the child was handed; the stand-in's found lines say which it looked up and found.
+        try:
+            with open(os.path.join(logdir, "stderr.txt"), encoding="utf-8", errors="replace") as handle:
+                found = patch_plan.found_line(shader_plans, handle.read())
+        except OSError as error:
+            found = f"patches: shader overrides found: unmeasured (stderr.txt: {error.strerror or error})"
+        print(found)
+        log(found)
     events.close()
     print(f"modules loaded: {len(modules)}")
     with open(os.path.join(logdir, "finished.txt"), "w", encoding="utf-8") as handle:

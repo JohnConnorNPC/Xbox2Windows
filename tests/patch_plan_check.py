@@ -1,7 +1,8 @@
 """Checks tools/startup/patch_plan.py: a manifest loaded through tools/patch_manifest.py (every loader
 refusal raised as a PatchError with its reason), the planner's own rules (id form, kinds, byte and
-patch caps), the input hash gate, and the stage 2 memory-patch plan, apply, report and environment
-rules. tests/patch_manifest_check.py checks the loader itself.
+patch caps, shader revisions and files), the input hash gate, the stage 2 memory-patch plan, apply,
+report and environment rules, and shader overrides. tests/patch_manifest_check.py checks the loader
+itself.
 
 The schema input is a synthetic PE32+ built here (headers, .text, .data, .reloc with one DIR64 entry
 and one ABSOLUTE pad); the first case parses it back and checks that layout. The plan input is a
@@ -12,9 +13,11 @@ to a temporary directory. Every refusal case is a negative control: the manifest
 whole, with the reason named. The hash gate is checked with a hash that differs from the right one
 only in its last hex digit and only in its first, so a gate that compares a prefix or a suffix
 fails here. Fixture hashes contain letters, so the loader's lowercase-only rule is reached.
-apply_memory runs against a fake process (bytes in a bytearray) whose writes are counted. Needs
-Python 3.11+ (tomllib).
+apply_memory runs against a fake process (bytes in a bytearray) whose writes are counted. Shader
+overrides use small files written next to the manifests; the key revisions of every pipeline are
+pinned to the runtime's and the translators' literals. Needs Python 3.11+ (tomllib).
 """
+import dataclasses
 import hashlib
 import os
 import struct
@@ -23,13 +26,14 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TOOLS = os.path.join(HERE, "..", "tools", "startup")
+REPO = os.path.join(HERE, "..")
+TOOLS = os.path.join(REPO, "tools", "startup")
 LOADER = os.path.normpath(os.path.join(HERE, "..", "tools", "patch_manifest.py"))
 sys.path.insert(0, TOOLS)
 import patch_plan as pm  # noqa: E402
 
 # Every case below is counted; a case that is removed or never reached fails the check.
-EXPECTED_CASES = 54 + 71
+EXPECTED_CASES = 54 + 71 + 57
 IMAGE_BASE = 0x140000000
 DIR64, HIGHLOW, ABSOLUTE = 10, 3, 0
 LOADED_BASE = 0x7FF6_1234_0000
@@ -663,6 +667,305 @@ def memory_cases(fx, case):
     assert not os.path.exists(work), "launch.py created its log directory before refusing"
 
 
+KEY = "0123456789abcdef"
+OTHER = "fedcba9876543210"
+# Each pipeline's key revision, where the runtime and the translator that writes the cache spell it.
+REVISION_SITES = {
+    "graphics": (("src/startup_stubs/d3d12_draw.inl", 'constexpr char revision[] = "{}";'),
+                 ("tools/startup/gfx2hlsl.py", "fnv(b'{}')")),
+    "compute": (("src/startup_stubs/d3d12_draw.inl", 'constexpr char compute_revision[] = "{}";'),
+                ("tools/startup/gfx2hlsl.py", "fnv(b'{}')")),
+    "mesh86": (("src/startup_stubs/mesh86_cache.inl", 'constexpr char revision[] = "{}";'),
+               ("tools/startup/mesh86_cache.py", "fnv(b'{}')")),
+}
+
+
+def shader_file(fx, name, data):
+    """Writes <name> next to the manifests (the loader takes bare file names only); returns (name, sha256)."""
+    with open(os.path.join(fx.root, name), "wb") as handle:
+        handle.write(data)
+    return name, hashlib.sha256(data).hexdigest()
+
+
+def shader(pid, key, pipeline, files, revision=None):
+    """A [[patch]] of kind shader; files: (ext, file, sha256)."""
+    listed = ", ".join(f'{{ ext = "{ext}", file = "{name}", sha256 = "{sha}" }}' for ext, name, sha in files)
+    return (f'[[patch]]\nid = "{pid}"\nkind = "shader"\nkey = "{key}"\npipeline = "{pipeline}"\n'
+            f'revision = "{revision or pm.PIPELINES[pipeline].revision}"\nfiles = [{listed}]\n'
+            f'why = "synthetic fixture"\nremove_when = "never; test input"\n')
+
+
+def shader_cases(fx, case):
+    """Kind shader: schema, plan_shaders, materialize_shaders, prepare, report, environment, revisions."""
+    txt = (".txt",) + shader_file(fx, "c.txt", b"x2w-manifest 2\nsynthetic compute manifest\n")
+    cso = (".cs.cso",) + shader_file(fx, "c.cs.cso", b"DXBC synthetic compute bytecode")
+    vs, ps = ((".vs.cso",) + shader_file(fx, "g.vs.cso", b"DXBC vs"), (".ps.cso",) + shader_file(fx, "g.ps.cso", b"DXBC ps"))
+    marker = (".mesh86.txt",) + shader_file(fx, "m.mesh86.txt", b"x2w-mesh86 1 synthetic\n")
+    ms = (".ms.cso",) + shader_file(fx, "m.ms.cso", b"DXBC ms")
+    compute = shader("cs", KEY, "compute", [txt, cso])
+
+    def accepted(*patches):
+        return pm.check(fx.write(target(fx.sha) + "".join(patches)), fx.input)
+
+    def plan_refused(text, fragment):
+        manifest = pm.check(fx.write(target(fx.sha) + text), fx.input)
+        try:
+            pm.plan_shaders(manifest)
+        except pm.PatchError as error:
+            assert fragment in str(error), f"refused for another reason: {error} (expected {fragment!r})"
+            return
+        raise AssertionError(f"planned shader files that must be refused ({fragment!r})")
+
+    def materialize_refused(plans, directory, fragment):
+        try:
+            pm.materialize_shaders(plans, directory)
+        except pm.PatchError as error:
+            assert fragment in str(error), f"refused for another reason: {error} (expected {fragment!r})"
+            return
+        raise AssertionError(f"materialized what must be refused ({fragment!r})")
+
+    case("compute override accepted")
+    manifest = accepted(compute)
+    (patch,) = manifest.patches
+    assert (patch.id, patch.kind, patch.key, patch.pipeline, patch.revision) == (
+        "cs", "shader", KEY, "compute", "x2w-startup-shader-29cs"), patch
+    assert [(f.ext, f.path, f.sha256) for f in patch.files] == [
+        (".txt", os.path.join(fx.root, "c.txt"), txt[2]),
+        (".cs.cso", os.path.join(fx.root, "c.cs.cso"), cso[2])], patch.files
+    case("graphics override accepted")
+    accepted(shader("gr", OTHER, "graphics", [txt, vs, ps]))
+    case("mesh86 override without .ps.cso accepted")
+    accepted(shader("me", OTHER, "mesh86", [marker, ms]))
+    case("mesh86 override with .ps.cso accepted")
+    accepted(shader("me", OTHER, "mesh86", [marker, ms, ps]))
+
+    # The key, the pipeline and its revision.
+    case("key of 15 hex digits")
+    refused(fx, target(fx.sha) + edit(compute, KEY, KEY[:-1]), "patch cs key must be 16 lowercase hex digits")
+    case("key with a non-hex digit")
+    refused(fx, target(fx.sha) + edit(compute, KEY, KEY[:-1] + "g"), "patch cs key must be 16 lowercase hex digits")
+    case("upper-case key")
+    refused(fx, target(fx.sha) + edit(compute, KEY, KEY.upper()), "patch cs key must be 16 lowercase hex digits")
+    case("key as an integer")
+    refused(fx, target(fx.sha) + edit(compute, f'"{KEY}"', "81985529216486895"),
+            "patch cs key must be 16 lowercase hex digits")
+    case("unknown pipeline")
+    refused(fx, target(fx.sha) + edit(compute, '"compute"', '"mesh57"'),
+            "patch cs pipeline must be one of: graphics, compute, mesh86")
+    case("graphics revision on a compute override")
+    refused(fx, target(fx.sha) + shader("cs", KEY, "compute", [txt, cso], pm.PIPELINES["graphics"].revision),
+            "revision 'x2w-startup-shader-29' is not a compute key revision (x2w-startup-shader-<n>cs)")
+    case("compute revision on a graphics override")
+    refused(fx, target(fx.sha) + shader("gr", KEY, "graphics", [txt, vs, ps], pm.PIPELINES["compute"].revision),
+            "revision 'x2w-startup-shader-29cs' is not a graphics key revision (x2w-startup-shader-<n>)")
+    case("graphics revision on a mesh86 override")
+    refused(fx, target(fx.sha) + shader("me", KEY, "mesh86", [marker, ms], pm.PIPELINES["graphics"].revision),
+            "revision 'x2w-startup-shader-29' is not a mesh86 key revision (x2w-startup-mesh-86-<n>)")
+    # The loader checks the form only; the planner refuses a revision that is not the runtime's current one.
+    for name, files, earlier in (("compute", [txt, cso], "x2w-startup-shader-28cs"),
+                                 ("graphics", [txt, vs, ps], "x2w-startup-shader-30"),
+                                 ("mesh86", [marker, ms], "x2w-startup-mesh-86-2")):
+        case(f"{name} revision of the right form but not the runtime's ({earlier})")
+        refused(fx, target(fx.sha) + shader("p", KEY, name, files, earlier),
+                f"patch p: revision '{earlier}' is not the runtime's {name} key revision {pm.PIPELINES[name].revision}")
+    case("the planner's pipelines are the loader's: same names, revisions of its forms, a subset of its files")
+    loader = pm._loader()
+    assert list(pm.PIPELINES) == list(loader.PIPELINES), (list(pm.PIPELINES), list(loader.PIPELINES))
+    for name, pipeline in pm.PIPELINES.items():
+        _, extensions, required = loader.PIPELINES[name]
+        assert loader.REVISIONS[name].fullmatch(pipeline.revision), (name, pipeline.revision)
+        assert set(required) <= set(pipeline.caps) <= set(extensions), (name, required, pipeline.caps, extensions)
+    assert set(loader.PIPELINES["compute"][1]) - set(pm.PIPELINES["compute"].caps) == {".cs.hlsl"}
+    case("revisions are the runtime's and the translators'")
+    for name, sites in REVISION_SITES.items():
+        revision = pm.PIPELINES[name].revision
+        for relative, spelling in sites:
+            with open(os.path.join(REPO, relative), encoding="utf-8") as handle:
+                found = handle.read().count(spelling.format(revision))
+            assert found == 1, f"{name}: {spelling.format(revision)!r} occurs {found} times in {relative}"
+
+    # Files: extensions per pipeline, required files, table shape.
+    case("compute override with a graphics stage")
+    refused(fx, target(fx.sha) + shader("cs", KEY, "compute", [txt, cso, vs]),
+            "ext '.vs.cso' is not a compute translation file (.txt, .cs.cso, .cs.hlsl)")
+    case("compute override with .cs.hlsl: the loader accepts it, the planner does not plan it")
+    hlsl = (".cs.hlsl",) + shader_file(fx, "c.cs.hlsl", b"// synthetic hlsl\n")
+    pm._loader().parse(target(fx.sha) + shader("cs", KEY, "compute", [txt, cso, hlsl]))
+    refused(fx, target(fx.sha) + shader("cs", KEY, "compute", [txt, cso, hlsl]),
+            "patch cs: ext '.cs.hlsl' is not a compute file the planner plans (.txt, .cs.cso)")
+    case("mesh86 override with a request extension")
+    refused(fx, target(fx.sha) + shader("me", KEY, "mesh86", [marker, ms, (".m86", ms[1], ms[2])]),
+            "ext '.m86' is not a mesh86 translation file")
+    case("ext not a string")
+    refused(fx, target(fx.sha) + edit(compute, 'ext = ".txt"', 'ext = [".txt"]'), "ext ['.txt'] is not a compute")
+    case("compute override without .cs.cso")
+    refused(fx, target(fx.sha) + shader("cs", KEY, "compute", [txt]), "compute override is missing: .cs.cso")
+    case("graphics override without .txt")
+    refused(fx, target(fx.sha) + shader("gr", KEY, "graphics", [vs, ps]), "graphics override is missing: .txt")
+    case("mesh86 override without .ms.cso")
+    refused(fx, target(fx.sha) + shader("me", KEY, "mesh86", [marker]), "mesh86 override is missing: .ms.cso")
+    case("ext listed twice")
+    refused(fx, target(fx.sha) + shader("cs", KEY, "compute", [txt, cso, txt]), "patch cs lists .txt twice")
+    case("two patches for one key")
+    refused(fx, target(fx.sha) + compute + shader("c2", KEY, "compute", [txt, cso]),
+            f"patches cs and c2 override the same key {KEY}")
+    case("file with a directory")
+    refused(fx, target(fx.sha) + shader("cs", KEY, "compute", [txt, (".cs.cso", "sub/c.cs.cso", cso[2])]),
+            "must be a bare file name")
+    case("empty files")
+    refused(fx, target(fx.sha) + edit(compute, compute[compute.index("files = "):compute.index("\nwhy")], "files = []"),
+            "files must be a non-empty array of tables")
+    case("file table with an extra key")
+    refused(fx, target(fx.sha) + edit(compute, 'ext = ".txt", ', 'ext = ".txt", size = 3, '),
+            "patch cs files[0] has unknown keys: size")
+    case("shader patch with a memory key")
+    refused(fx, target(fx.sha) + edit(compute, 'kind = "shader"', 'kind = "shader"\nrva = 1'),
+            "[[patch]] 0 has unknown keys: rva")
+    case("shader patch without revision")
+    refused(fx, target(fx.sha) + edit(compute, 'revision = "x2w-startup-shader-29cs"\n', ""),
+            "[[patch]] 0 is missing: revision")
+
+    # plan_shaders: the files themselves.
+    case("plan reads and hashes every file")
+    (plan,) = pm.plan_shaders(manifest)
+    with open(os.path.join(fx.root, "c.cs.cso"), "rb") as handle:
+        assert plan == pm.ShaderPlan("cs", KEY, ((".txt", txt[2], b"x2w-manifest 2\nsynthetic compute manifest\n"),
+                                                 (".cs.cso", cso[2], handle.read()))), plan
+    assert pm.plan_shaders(None) == () and pm.plan_shaders(accepted(MEMORY)) == ()
+    case("missing shader file")
+    plan_refused(shader("cs", KEY, "compute", [txt, (".cs.cso", "absent.cso", cso[2])]), "cannot read it")
+    case("directory as a shader file")
+    os.makedirs(os.path.join(fx.root, "shaders"), exist_ok=True)
+    plan_refused(shader("cs", KEY, "compute", [txt, (".cs.cso", "shaders", cso[2])]), "is not a regular file")
+    case("shader file sha256 wrong in its last digit")
+    wrong = cso[2][:-1] + ("0" if cso[2][-1] != "0" else "1")
+    plan_refused(shader("cs", KEY, "compute", [txt, (".cs.cso", cso[1], wrong)]), ".cs.cso file")
+    plan_refused(shader("cs", KEY, "compute", [txt, (".cs.cso", cso[1], wrong)]), "does not match its sha256")
+    case("empty shader file")
+    plan_refused(shader("cs", KEY, "compute", [txt, (".cs.cso",) + shader_file(fx, "empty.cso", b"")]), "is empty")
+    case("mesh86 marker of 96 bytes accepted, 97 refused")
+    pm.plan_shaders(accepted(shader("me", KEY, "mesh86", [(".mesh86.txt",) + shader_file(fx, "m96", b"m" * 96), ms])))
+    plan_refused(shader("me", KEY, "mesh86", [(".mesh86.txt",) + shader_file(fx, "m97", b"m" * 97), ms]),
+                 "has more than 96 bytes, the most the runtime reads")
+    case("mesh86 stage of 1 MiB accepted, 1 MiB + 1 refused")
+    pm.plan_shaders(accepted(shader("me", KEY, "mesh86", [marker, (".ms.cso",) + shader_file(fx, "ms1", b"s" * (1 << 20))])))
+    plan_refused(shader("me", KEY, "mesh86", [marker, (".ms.cso",) + shader_file(fx, "ms2", b"s" * ((1 << 20) + 1))]),
+                 f"has more than {1 << 20} bytes")
+    case("compute manifest of 16 MiB + 1 refused")
+    plan_refused(shader("cs", KEY, "compute", [(".txt",) + shader_file(fx, "big.txt", b"t" * ((16 << 20) + 1)), cso]),
+                 f"has more than {16 << 20} bytes")
+
+    # materialize_shaders: names, bytes, the copy re-hashed, the directory.
+    run = os.path.join(fx.root, "run", "patch_shaders")
+    case("materialized names and bytes")
+    graphics = shader("gr", OTHER, "graphics", [txt, vs, ps])
+    plans = pm.plan_shaders(accepted(compute, graphics))
+    assert pm.materialize_shaders(plans, os.path.join(run, "..", "patch_shaders")) == run  # absolute, normalized
+    names = sorted(os.listdir(run))
+    assert names == [f"{KEY}.cs.cso", f"{KEY}.txt", f"{OTHER}.ps.cso", f"{OTHER}.txt", f"{OTHER}.vs.cso"], names
+    for plan in plans:
+        for ext, sha, data in plan.files:
+            with open(os.path.join(run, plan.key + ext), "rb") as handle:
+                assert handle.read() == data and hashlib.sha256(data).hexdigest() == sha, (plan.key, ext)
+    assert pm.materialize_shaders((), run) is None
+    case("an earlier run's override files are removed")
+    pm.materialize_shaders(plans[:1], run)
+    assert sorted(os.listdir(run)) == [f"{KEY}.cs.cso", f"{KEY}.txt"], os.listdir(run)
+    case("a foreign file in the directory refuses")
+    with open(os.path.join(run, "notes.txt"), "w") as handle:
+        handle.write("keep")
+    materialize_refused(plans, run, "holds notes.txt, which is not an override file")
+    assert os.path.exists(os.path.join(run, "notes.txt"))
+    case("a copy that does not hash to sha256 refuses")
+    (ext, sha, data), rest = plans[0].files[0], plans[0].files[1:]
+    tampered = (dataclasses.replace(plans[0], files=((ext, sha, data + b"!"),) + rest),)
+    materialize_refused(tampered, os.path.join(fx.root, "run2"), "patch cs: the copy of its .txt file does not match its sha256")
+    case("directory path at the runtime's limit accepted, one longer refused")
+    edge = os.path.join(fx.root, "x" * (pm.SHADER_DIR_MAX - len(fx.root) - 1))
+    assert len(edge) == pm.SHADER_DIR_MAX == 231
+    assert pm.materialize_shaders(plans[:1], edge) == edge
+    materialize_refused(plans[:1], edge + "y", "the shader override directory path has 232 UTF-16 units")
+    assert not os.path.exists(edge + "y"), "the over-long directory was created"
+    case("directory path of 231 characters with one outside the BMP refused (232 UTF-16 units)")
+    wide = edge[:-1] + "\U0001F600"
+    assert len(wide) == 231 and len(wide.encode("utf-16-le")) // 2 == 232
+    materialize_refused(plans[:1], wide, "the shader override directory path has 232 UTF-16 units")
+    assert not os.path.exists(wide), "the over-long directory was created"
+
+    # prepare(), the report line, the command line and the child environment.
+    case("shader-only manifest against a delay-load PE: gated, not parsed")
+    path, sha = write_input(fx, "delay-shader.exe", loader_pe(delay=True))
+    manifest, memory = pm.prepare({pm.ENV: fx.write(target(sha) + compute)}, path)
+    assert memory == () and [p.id for p in manifest.patches] == ["cs"], (memory, manifest.patches)
+    case("report line of a shader-only manifest: offered, not active")
+    assert pm.report_line(manifest) == f"patches: manifest sha256={manifest.sha256} offered=cs", pm.report_line(manifest)
+    case("shader-only manifest still hash-gated")
+    try:
+        pm.prepare({pm.ENV: fx.write(target(fx.sha) + compute)}, path)
+        raise AssertionError("a shader manifest passed the gate for another input")
+    except pm.PatchError as error:
+        assert "manifest is for another input" in str(error), error
+    case("memory and shader patches in one manifest")
+    at = check_loader_pe(fx.loader_bytes)
+    rd = mem("rd", 0x2300, b"\x90" * 4, hashlib.sha256(at(0x2300, 4)).hexdigest())
+    manifest, memory = pm.prepare({pm.ENV: fx.write(target(fx.loader_sha) + rd + compute)}, fx.loader)
+    assert [p.id for p in memory] == ["rd"] and [p.id for p in pm.plan_shaders(manifest)] == ["cs"], memory
+    assert pm.report_line(manifest) == f"patches: manifest sha256={manifest.sha256} active=rd offered=cs", \
+        pm.report_line(manifest)
+    case("unverified line of a mixed manifest")
+    line = pm.unverified_line(manifest)
+    assert line == (f"patches: unverified manifest sha256={manifest.sha256} active=rd offered=cs "
+                    "(written; the process ended before the loader-breakpoint re-check)"), line
+    case("cli plan of a shader manifest")
+    code, out = run_cli("plan", fx.write(target(fx.sha) + compute), fx.input)
+    assert code == 0 and out.startswith("patches: ok manifest sha256=") and out.endswith(" patches=1 planned"), (code, out)
+    case("cli plan of a shader manifest with a wrong file hash")
+    code, out = run_cli("plan", fx.write(target(fx.sha) + shader("cs", KEY, "compute", [txt, (".cs.cso", cso[1], wrong)])),
+                        fx.input)
+    assert code == 3 and out.startswith("patches: refused: patch cs: .cs.cso file ") and \
+        out.endswith(" does not match its sha256"), (code, out)
+    case("child environment drops a stale shader override directory")
+    child = pm.child_env({pm.SHADER_DIR_ENV: "stale", pm.SHADER_DIR_ENV.lower(): "stale2", "PATH": "/bin"})
+    assert child == {"PATH": "/bin"}, child
+    case("the runtime reads the variable the launcher sets")
+    with open(os.path.join(REPO, "src", "startup_stubs", "shader_override.h"), encoding="utf-8") as handle:
+        header = handle.read()
+    with open(os.path.join(REPO, "src", "startup_stubs", "d3d12_draw.inl"), encoding="utf-8") as handle:
+        source = handle.read()
+    spelling = f'GetEnvironmentVariableW(L"{pm.SHADER_DIR_ENV}", dir, MAX_PATH)'
+    assert header.count(spelling) == 1, f"{spelling!r} occurs {header.count(spelling)} times in shader_override.h"
+    asked = "overrides.lookup(out, key, extension)"
+    assert source.count(asked) == 1, f"{asked!r} occurs {source.count(asked)} times in d3d12_draw.inl"
+
+    # What the run summary says the stand-in found at its lookups.
+    plans = (pm.ShaderPlan("a", KEY, ()), pm.ShaderPlan("b", OTHER, ()), pm.ShaderPlan("c", "0" * 15 + "1", ()))
+    case("found line counts the found lines of offered keys only")
+    log = (f"x2w-draw compute pipeline {KEY} translated\r\n"
+           f"[  12.345] x2w-patch shader {KEY} found .txt\r\n"
+           f"x2w-patch shader {KEY} has no .ps.cso, not taken from the cache\r\n"
+           f"x2w-patch shader {OTHER} has no .txt, not taken from the cache\r\n"
+           f"x2w-patch shader {'2' * 16} found .txt\r\n"
+           f"x2w-patch shader {OTHER} served .txt\r\n")  # the old wording counts for nothing
+    line = pm.found_line(plans, log)
+    assert line == "patches: shader overrides found 1 of 3: found=a not_found=b,c", line
+    case("found line when nothing was found")
+    line = pm.found_line(plans, "")
+    assert line == "patches: shader overrides found 0 of 3: found=- not_found=a,b,c", line
+    case("the found parser matches the runtime's log line")
+    found = 'log("x2w-patch shader %016llx found %ls", key, extension);'
+    missing = 'log("x2w-patch shader %016llx has no %ls, not taken from the cache", key, extension);'
+    for literal in (found, missing):
+        assert source.count(literal) == 1, f"{literal!r} occurs {source.count(literal)} times in d3d12_draw.inl"
+
+    def runtime_line(literal, key, ext):
+        text = literal.split('"')[1]
+        return text.replace("%016llx", f"{key:016x}").replace("%ls", ext)
+
+    match = pm.FOUND_RE.search(runtime_line(found, 0x0123456789ABCDEF, ".cs.cso"))
+    assert match and match.groups() == (KEY, ".cs.cso"), match
+    assert not pm.FOUND_RE.search(runtime_line(missing, 0x0123456789ABCDEF, ".cs.cso")), "a missing file parsed as found"
+
+
 def cases(fx, checked):
     good = target(fx.sha) + MEMORY + MEMORY2
 
@@ -726,8 +1029,16 @@ def cases(fx, checked):
     refused(fx, target(fx.sha) + edit(MEMORY, '"memory"', '"data"'), "kind 'data' is not supported")
     case("unknown kind")
     refused(fx, target(fx.sha) + edit(MEMORY, '"memory"', '"code"'), "kind 'code' is not supported")
-    case("kind shader, which the loader accepts, has no consumer here")
-    refused(fx, target(fx.sha) + SHADER, 'patch s001: kind "shader" has no consumer in the startup debugger')
+    # A kind the loader would accept besides memory and shader: KINDS extended in this process only.
+    case("a loader kind other than memory and shader has no consumer here")
+    loader = pm._loader()
+    loader.KINDS["data"] = set(loader.KINDS["memory"])
+    try:
+        refused(fx, target(fx.sha) + edit(MEMORY, '"memory"', '"data"'),
+                'patch p001: kind "data" has no consumer in the startup debugger')
+    finally:
+        del loader.KINDS["data"]
+    pm.check(fx.write(target(fx.sha) + SHADER), fx.input)
 
     # Unknown keys.
     case("unknown top-level key")
@@ -854,6 +1165,7 @@ def cases(fx, checked):
     assert os.path.samefile(pm._loader().__file__, LOADER), pm._loader().__file__
 
     memory_cases(fx, case)
+    shader_cases(fx, case)
 
 
 def main():
@@ -868,10 +1180,10 @@ def main():
     if len(checked) != EXPECTED_CASES:
         print(f"patch_plan: FAIL: {len(checked)} cases ran, expected {EXPECTED_CASES}")
         return 1
-    print(f"patch_plan: PASS ({len(checked)} cases: loader refusals, planner rules, input hash gate and "
+    print(f"patch_plan: PASS ({len(checked)} cases: loader refusals, planner rules, input hash gate, "
           f"memory-patch plan, "
-          f"apply, report and environment rules, each refusal named; gate checked with a hash wrong only in its "
-          f"last and only in its first digit)")
+          f"apply, report and environment rules and shader overrides, each refusal named; gate checked with a hash "
+          f"wrong only in its last and only in its first digit)")
     return 0
 
 
