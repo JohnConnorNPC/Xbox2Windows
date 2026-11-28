@@ -1,0 +1,2 @@
+# Memory patches in the one-command CPU converter (#3037; docs/experiments/patch-manifests.md).
+tests/exe_aot_patch_check.py

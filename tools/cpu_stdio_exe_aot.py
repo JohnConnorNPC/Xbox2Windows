@@ -6,7 +6,7 @@ from pathlib import Path
 import pefile
 
 from cpu_leaf_aot import export_rva
-from cpu_switch_aot import HostImport, PRELUDE, Program
+from cpu_switch_aot import HostImport, PRELUDE, Program, load_bindings
 
 
 STDIO = "api-ms-win-crt-stdio-l1-1-0.dll"
@@ -27,9 +27,31 @@ static word host_fflush(word stream) {
 """
 
 
-def translate(image, bindings=IMPORTS, host=HOST, *, allow_process_exit=False, entry_export=None):
-    data = Path(image).read_bytes()
+def record_reads(pe, reads):
+    """Appends (rva, end) to reads for every read of pe's section bytes (pefile's SectionStructure.get_data,
+    behind pe.get_data, cpu_ranges.image_bytes and get_string_at_rva) from now on."""
+    def recorder(section, get_data):
+        def get(start=None, length=None, ignore_padding=False):
+            found = get_data(start, length, ignore_padding)
+            rva = section.get_VirtualAddress_adj() if start is None else start
+            reads.append((rva, rva + len(found)))
+            return found
+        return get
+    for section in pe.sections:
+        section.get_data = recorder(section, section.get_data)
+
+
+def translate(image, bindings=IMPORTS, host=HOST, *, allow_process_exit=False, entry_export=None,
+              data=None, ranges=None, image_sha256=None, reads=None):
+    """data, when given, is lifted instead of the bytes at image (a patched copy, tools/exe_aot.py
+    --patches); image_sha256 then names the original input. A range manifest (ranges, as for
+    cpu_switch_aot.py --bind-ranges) and aot_source_sha256 both refer to that original. reads, a list,
+    collects the (rva, end) of every section read of the translation (record_reads)."""
+    if data is None:
+        data = Path(image).read_bytes()
     with pefile.PE(data=data, fast_load=True) as pe:
+        if reads is not None:
+            record_reads(pe, reads)
         opt = pe.OPTIONAL_HEADER
         if (pe.FILE_HEADER.Machine != 0x8664 or opt.Magic != 0x20b or opt.Subsystem != 3
                 or not pe.FILE_HEADER.Characteristics & 2 or pe.FILE_HEADER.Characteristics & 0x2000):
@@ -57,7 +79,8 @@ def translate(image, bindings=IMPORTS, host=HOST, *, allow_process_exit=False, e
                     symbol = imp.name.decode("ascii") if imp.name else f"#{imp.ordinal}"
                     raise ValueError(f"unbound console import {dll}!{symbol}")
                 imports[slot] = binding
-        program = Program(pe, imports=imports)
+        program = Program(pe, None if ranges is None else load_bindings(ranges), imports=imports,
+                          image_sha256=image_sha256)
         entry = opt.AddressOfEntryPoint if entry_export is None else export_rva(pe, entry_export)
         if entry not in program.entries:
             raise ValueError(f"unverified process entry at RVA {entry:#x}")
@@ -68,7 +91,7 @@ def translate(image, bindings=IMPORTS, host=HOST, *, allow_process_exit=False, e
             raise ValueError("process entry must define its 32-bit exit code")
         provenance = []
         if entry_export is not None:
-            digest = hashlib.sha256(data).hexdigest()
+            digest = image_sha256 or hashlib.sha256(data).hexdigest()
             provenance.append(f'extern "C" __declspec(dllexport) const char aot_source_sha256[] = "{digest}";')
         return "\n".join([PRELUDE, host, *program.sources, source, *provenance,
                           "int main() { return static_cast<int>(process_entry()); }", ""])

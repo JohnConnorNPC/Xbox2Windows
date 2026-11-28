@@ -367,7 +367,7 @@ class Entries:
 
     MAX_CHAIN = 32
 
-    def __init__(self, pe, bindings=None):
+    def __init__(self, pe, bindings=None, *, image_sha256=None):
         table = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
         data = image_bytes(pe, table.VirtualAddress, table.Size - table.Size % 12) if table.Size >= 12 else b""
         self.records = list(struct.iter_unpack("<III", data))
@@ -418,12 +418,13 @@ class Entries:
                              for desc in getattr(pe, "DIRECTORY_ENTRY_IMPORT", ()) for imp in desc.imports}
         self.bound = {}  # start -> (end, name) of each verified range binding
         if bindings is not None:
-            self.bind(pe, bindings)
+            self.bind(pe, bindings, image_sha256=image_sha256)
 
-    def bind(self, pe, bindings):
+    def bind(self, pe, bindings, *, image_sha256=None):
         """Verify a range manifest for this image: its hash, executable bounds and no overlap with
-        another binding or a runtime function."""
-        digest = hashlib.sha256(bytes(pe.__data__)).hexdigest()
+        another binding or a runtime function. image_sha256 names the original input when pe holds a
+        patched copy of it (tools/exe_aot.py --patches); the manifest must name that original."""
+        digest = image_sha256 or hashlib.sha256(bytes(pe.__data__)).hexdigest()
         if bindings["image_sha256"] != digest:
             raise ValueError(f"range binding is for another image: manifest sha256 {bindings['image_sha256']}, "
                              f"image sha256 {digest}")
@@ -1896,12 +1897,12 @@ class Program:
     bytes and it reads no more, by induction on the depth of calls that return. The functions of a
     cycle are kept once its first function is done, after declarations, so each may call any other."""
 
-    def __init__(self, pe, bindings=None, *, image_data=False, imports=None, host_cpu=False):
+    def __init__(self, pe, bindings=None, *, image_data=False, imports=None, host_cpu=False, image_sha256=None):
         self.pe = pe
         self.image_data = image_data
         self.host_cpu = host_cpu
         self.imports = imports or {}
-        self.entries = Entries(pe, bindings)
+        self.entries = Entries(pe, bindings, image_sha256=image_sha256)
         self.active = []  # entry of each translation in progress, outermost first
         self.internal = []  # whether each of those is an internal function
         self.lows = []  # per active translation: the lowest active depth it has used a summary from

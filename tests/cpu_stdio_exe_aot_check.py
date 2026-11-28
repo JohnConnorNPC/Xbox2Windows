@@ -44,8 +44,13 @@ def build_console_exe(
     export_native_entry: bool = True,
     register_entry_pdata: bool = True,
     entry_rva_override: int | None = None,
+    constant: int = 0x1357,
 ):
-    """Build a minimal synthetic AMD64 PE32+ console EXE for cpu_stdio_exe_aot."""
+    """Build a minimal synthetic AMD64 PE32+ console EXE for cpu_stdio_exe_aot.
+
+    entry_mode "const" returns `constant` from the entry (`mov eax, imm32; ret`). "bare_call" calls a
+    function without unwind data (placed after the startup wrapper, outside .pdata) that returns it.
+    For both, the returned dict's "imm32_rva" is the RVA of the immediate."""
     text = bytearray(SECTION_SIZE)
     rdata = bytearray(SECTION_SIZE)
     text_cursor = 0
@@ -162,6 +167,11 @@ def build_console_exe(
         code += b"\xB0\x01\xC3"  # mov al, 1; ret
     elif entry_mode == "loop_forever":
         code += b"\xEB\xFE"  # jmp $
+    elif entry_mode == "const":
+        code += b"\xB8" + struct.pack("<I", constant) + b"\xC3"  # mov eax, constant; ret
+    elif entry_mode == "bare_call":
+        # sub rsp, 0x28; call <bare function, rel32 filled in below>; add rsp, 0x28; ret
+        code += b"\x48\x83\xEC\x28" + b"\xE8\0\0\0\0" + b"\x48\x83\xC4\x28\xC3"
     else:
         raise ValueError(f"unknown entry_mode {entry_mode!r}")
 
@@ -182,6 +192,15 @@ def build_console_exe(
     actual_startup = emit_text(bytes(startup))
     assert actual_startup == startup_rva
     startup_end = startup_rva + len(startup)
+
+    meta = {}
+    if entry_mode == "const":
+        meta["imm32_rva"] = entry_rva + 1
+    elif entry_mode == "bare_call":
+        bare_rva = emit_text(b"\xB8" + struct.pack("<I", constant) + b"\xC3")  # no .pdata record
+        call = entry_rva + 4 - TEXT_RVA
+        text[call + 1:call + 5] = _rel32(entry_rva + 9, bare_rva)
+        meta.update(bare_rva=bare_rva, bare_end=bare_rva + 6, imm32_rva=bare_rva + 1)
 
     # Optional export table publishing native_entry.
     export_rva = 0
@@ -300,7 +319,7 @@ def build_console_exe(
     buf[RAW_OFFSET:RAW_OFFSET + SECTION_SIZE] = text
     buf[RAW_OFFSET + SECTION_SIZE:RAW_OFFSET + SECTION_SIZE * 2] = rdata
 
-    return bytes(buf), {"entry_rva": entry_rva, "startup_rva": startup_rva}
+    return bytes(buf), {"entry_rva": entry_rva, "startup_rva": startup_rva, **meta}
 
 
 class CpuStdioExeAotPositiveTests(unittest.TestCase):

@@ -1,12 +1,16 @@
 """Convert a PE32+ x64 EXE into a recompiled Windows EXE with one command, or report the first refusal.
 
-The stages run in order: header, imports, translate, build. Each profile names the imports the shared
-lifter can bind for a whole program. The first profile that binds every import is translated. A refusal
-names its stage, the first refused RVA when the lifter gives one, and every import without a binding.
+The stages run in order: header, imports, patches, translate, build. Each profile names the imports the
+shared lifter can bind for a whole program. The first profile that binds every import is translated. With
+--patches, a patch manifest bound to the input (docs/experiments/patch-manifests.md) is planned against the
+input bytes and applied to a copy, and the copy is translated; the report's sha256, a --bind-ranges range
+manifest and aot_source_sha256 still name the original input. The report's patches.active names the patches
+the translator read, and not_lifted the rest (split_lifted). A refusal names its stage, the first refused RVA when the lifter gives one, and every import without a binding.
 OUT_DIR/report.json is written for every outcome. Generated files are named <stem>_aot.cpp and
 <stem>_aot.exe; stale copies from an earlier run are removed first.
 """
 import argparse
+import bisect
 import hashlib
 import json
 import os
@@ -20,6 +24,8 @@ import tempfile
 import pefile
 
 import cpu_stdio_exe_aot
+from cpu_switch_aot import load_bindings
+from startup import patch_plan
 
 
 # Profile name -> (import bindings, host source, translator). Add new profiles here.
@@ -27,6 +33,11 @@ PROFILES = {
     "console-stdio": (cpu_stdio_exe_aot.IMPORTS, cpu_stdio_exe_aot.HOST, cpu_stdio_exe_aot.translate),
 }
 OPTIONAL_IMPORTS = {cpu_stdio_exe_aot.STARTUP_ONLY}
+# Profiles whose translator lifts code only (no image data): a patch outside an executable section would be
+# planned and reported but could not change the output, so it is refused.
+CODE_ONLY_PROFILES = {"console-stdio"}
+IMAGE_SCN_MEM_EXECUTE = 0x20000000
+NOT_LIFTED = "the translator read no byte of its range (outside every lifted function)"
 FIRST_RVA = re.compile(r"\bRVA (0x[0-9a-f]+)")
 CXX_FLAGS = ("/nologo", "/std:c++17", "/O2", "/MT", "/EHsc")
 BUILD_TIMEOUT_S = 120
@@ -64,6 +75,73 @@ def read_header(data):
             }, imports
     except pefile.PEFormatError as exc:
         raise Refusal("header", f"not a PE image: {exc}") from exc
+
+
+def apply_patches(manifest_path, data, profile):
+    """(manifest, patched copy of data) for a patch manifest bound to data, the one read of the input.
+
+    tools/startup/patch_plan.py loads the manifest gated on data (tools/patch_manifest.py's load_data), so its
+    input_sha256 must be the SHA-256 of data, and plans every memory patch against data; in a code-only profile
+    each range must lie in an executable section. The replacements are written into a copy at their file
+    offsets. Raises Refusal("patches")."""
+    try:
+        manifest = patch_plan.load(manifest_path, data)
+        plans = patch_plan.plan_memory(manifest, data)
+        image = patch_plan.parse_pe(data)
+        with pefile.PE(data=data, fast_load=True) as pe:
+            for patch in plans:
+                # The section the planner placed the patch in, and its pefile header for the characteristics.
+                planned = next(s for s in image.sections if s.va <= patch.rva < s.end)
+                section = next((s for s in pe.sections if s.VirtualAddress == planned.va), None)
+                where = f"patch {patch.id}: range {patch.rva:#x}-{patch.rva + len(patch.data):#x}"
+                if section is None:
+                    raise patch_plan.PatchError(f"{where}: no section header starts at {planned.va:#x}")
+                if profile in CODE_ONLY_PROFILES and not section.Characteristics & IMAGE_SCN_MEM_EXECUTE:
+                    raise patch_plan.PatchError(f"{where} is in section {planned.name}, which profile {profile} "
+                                                    f"does not lift (not executable)")
+        patched = bytearray(data)
+        for patch in plans:
+            offset = image.offset(patch.rva, len(patch.data), f"patch {patch.id}")
+            patched[offset:offset + len(patch.data)] = patch.data
+    except patch_plan.PatchError as exc:
+        raise Refusal("patches", str(exc)) from exc
+    return manifest, bytes(patched)
+
+
+def split_lifted(patches, reads):
+    """(active, not_lifted) of the memory patches written into the lifted copy. reads holds the (rva, end) of
+    every section read of the translation (cpu_stdio_exe_aot.record_reads): a patch is active when its range
+    overlaps one. The generated source depends on no other byte of the copy, so a patch outside every read
+    could not change it. Active means read, not used: a lifted function's whole range is read, decoded or not."""
+    spans = []
+    for low, high in sorted(r for r in reads if r[1] > r[0]):
+        if spans and low <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], high)
+        else:
+            spans.append([low, high])
+    starts = [low for low, _ in spans]
+    active, not_lifted = [], []
+    for patch in patches:
+        i = bisect.bisect_right(starts, patch.rva + len(patch.data) - 1) - 1  # the last span starting by its end
+        (active if i >= 0 and spans[i][1] > patch.rva else not_lifted).append(patch)
+    return active, not_lifted
+
+
+def converter_patch_line(manifest, active, not_lifted):
+    """The conversion's patch line: active= names the patches the translator read, and `not lifted: <n>`
+    counts the rest. Without an active patch the line does not start with `patches: manifest`."""
+    tail = f" not lifted: {len(not_lifted)}" if not_lifted else ""
+    if not active:
+        return f"patches: none active, manifest sha256={manifest.sha256}{tail}"
+    return f"patches: manifest sha256={manifest.sha256} active={','.join(patch.id for patch in active)}{tail}"
+
+
+def patch_provenance(report):
+    """C++ declarations naming the manifest and the patched bytes; the source's aot_source_sha256 stays the input's."""
+    patches = report["patches"]
+    return "".join(f'extern "C" __declspec(dllexport) const char {name}[] = "{patches[key]}";\n'
+                   for name, key in (("aot_patch_manifest_sha256", "manifest_sha256"),
+                                     ("aot_patched_sha256", "patched_sha256")))
 
 
 def import_label(dll, name):
@@ -175,13 +253,15 @@ def build(cxx, source, exe, *, timeout=BUILD_TIMEOUT_S):
     return compiler_name
 
 
-def convert(image, out_dir, *, entry_export=None, cxx=None, compile_exe=True):
+def convert(image, out_dir, *, entry_export=None, cxx=None, compile_exe=True, patches=None, bind_ranges=None):
     image, out_dir, source, exe, report_path, artifacts = _validate_paths(image, out_dir)
     data = image.read_bytes()
     out_dir.mkdir(parents=True, exist_ok=True)
     build_artifacts = artifacts[1:]
 
-    report = {"input": str(image), "sha256": hashlib.sha256(data).hexdigest(), "entry_export": entry_export}
+    report = {"input": str(image), "sha256": hashlib.sha256(data).hexdigest(), "entry_export": entry_export,
+              "patches": None, "patch_line": patch_plan.report_line(None),
+              "bind_ranges": None if bind_ranges is None else str(Path(bind_ranges).resolve())}
     try:
         report["header"], imports = read_header(data)
         report["imports"] = [import_label(*key) for key in imports]
@@ -191,11 +271,34 @@ def convert(image, out_dir, *, entry_export=None, cxx=None, compile_exe=True):
             raise Refusal("imports", f"{len(unbound)} import(s) have no binding in profile {profile}; "
                                      f"first {unbound[0]}", unbound=unbound)
         bindings, host, translate = PROFILES[profile]
+        lifted = data
+        if patches is not None:
+            manifest, lifted = apply_patches(patches, data, profile)
+        ranges = None  # read once here and checked with cpu_switch_aot.load_bindings, as the translator reads it
+        if bind_ranges is not None:
+            try:
+                ranges = json.loads(Path(bind_ranges).read_text(encoding="utf-8"))
+                if not isinstance(ranges, dict):
+                    raise ValueError("expected a JSON object")
+                load_bindings(ranges)
+            except (OSError, ValueError, TypeError, AttributeError, RecursionError) as exc:
+                raise Refusal("translate", f"range manifest {report['bind_ranges']}: {exc}") from exc
+        reads = None if patches is None else []
         try:
-            text = translate(image, bindings, host, entry_export=entry_export)
+            text = translate(image, bindings, host, entry_export=entry_export, data=lifted, ranges=ranges,
+                             image_sha256=report["sha256"], reads=reads)
         except (ValueError, pefile.PEFormatError) as exc:
             match = FIRST_RVA.search(str(exc))
             raise Refusal("translate", str(exc), rva=match and match.group(1)) from exc
+        if patches is not None:
+            active, not_lifted = split_lifted(manifest.patches, reads)
+            report["patches"] = {"manifest": manifest.path, "manifest_sha256": manifest.sha256,
+                                 "active": [patch.id for patch in active],
+                                 "not_lifted": [{"id": patch.id, "reason": NOT_LIFTED} for patch in not_lifted],
+                                 "patched_sha256": hashlib.sha256(lifted).hexdigest()}
+            report["patch_line"] = converter_patch_line(manifest, active, not_lifted)
+            if active:  # otherwise the source is the original's translation: no patch provenance
+                text += patch_provenance(report)
         _atomic_write_text(source, text, encoding="ascii")
         report["source"] = str(source)
         for stale in build_artifacts:
@@ -210,6 +313,11 @@ def convert(image, out_dir, *, entry_export=None, cxx=None, compile_exe=True):
             stale.unlink(missing_ok=True)
         report["status"] = "refused"
         report["refusal"] = {"stage": refusal.stage, "message": str(refusal), **refusal.details}
+        if refusal.stage == "patches":
+            report["patch_line"] = f"patches: refused: {refusal}"
+        elif patches is not None:  # header, imports (the manifest was never read), translate or build
+            report["patch_line"] = (f"patches: refused: not applied, the conversion was refused at the "
+                                    f"{refusal.stage} stage")
     _atomic_write_text(report_path, json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
 
@@ -221,10 +329,15 @@ def main(argv=None) -> int:
     parser.add_argument("--entry-export", help="lift this returning export instead of the PE entry point")
     parser.add_argument("--cxx", help="C++ compiler (default: cl on PATH)")
     parser.add_argument("--no-build", action="store_true", help="stop after writing the generated C++")
+    parser.add_argument("--patches", type=Path, metavar="MANIFEST",
+                        help="patch manifest bound to the input; its memory patches are translated")
+    parser.add_argument("--bind-ranges", type=Path, metavar="MANIFEST",
+                        help="range manifest of functions without unwind data, bound to the input's sha256 "
+                             "(as for cpu_switch_aot.py)")
     args = parser.parse_args(argv)
     try:
         report = convert(args.image, args.out_dir, entry_export=args.entry_export, cxx=args.cxx,
-                         compile_exe=not args.no_build)
+                         compile_exe=not args.no_build, patches=args.patches, bind_ranges=args.bind_ranges)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         parser.exit(2, f"{exc}\n")
     if report["status"] == "refused":
@@ -236,6 +349,7 @@ def main(argv=None) -> int:
             print(f"  {line}", file=sys.stderr)
         return 1
     print(f"{report['status']} with profile {report['profile']}: {report.get('exe', report['source'])}")
+    print(report["patch_line"])
     return 0
 
 

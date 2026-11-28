@@ -9233,6 +9233,11 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_exe_aot_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu_exe_aot_cli_check.py")
     set_tests_properties(cpu_exe_aot_cli_check PROPERTIES TIMEOUT 60)
+    # Memory patches in the CPU translator (#3037): builds and runs a synthetic EXE converted with and
+    # without a patch manifest (exit 0x1357 / 0x2468) and with a range manifest for the original input.
+    add_test(NAME cpu_exe_aot_patch COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/exe_aot_patch_check.py" "${CMAKE_CXX_COMPILER}")
+    set_tests_properties(cpu_exe_aot_patch PROPERTIES TIMEOUT 300)
     add_library(cpu_exe_second_provider SHARED tests/cpu/exe_second_provider.cpp)
     target_link_libraries(cpu_exe_second_provider PRIVATE cpu_exe_io)
     foreach(variant IN ITEMS original inverted pair swapped framed image two_providers nested nested_bypass)

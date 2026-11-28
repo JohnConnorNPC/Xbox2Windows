@@ -2,7 +2,8 @@
 
 A patch manifest describes adjustments to a source-translated build without changing the input
 file on disk. The format and the loader are in `tools/patch_manifest.py`. Stage 2, `memory` patches
-that the startup debugger writes into the title's image, is planned by `tools/startup/patch_plan.py`
+that the startup debugger writes into the title's image and that the CPU converter
+(`tools/exe_aot.py --patches`) translates, is planned by `tools/startup/patch_plan.py`
 ([Memory patches](#memory-patches-stage-2)). Data patches in the file layer and translator hooks
 will each come in their own change ([#3037](https://github.com/R0Y00/Xbox2Windows/issues/3037)).
 
@@ -32,6 +33,10 @@ bytes = "90c3"                    # the replacement, lowercase hex
 - **Memory patches:** `bytes` must be non-empty, and every byte it replaces needs an RVA below 2^32: a 1-byte patch at `0xffffffff` is accepted, a 2-byte one is not. Two memory patches may not overlap. Whether the span lies in a section's file-backed bytes is checked by the planner ([Memory patches](#memory-patches-stage-2)).
 - **Original bytes are never stored:** `expect_sha256` is a hash of the bytes the patch replaces. The loader only checks its shape; the planner compares it with the input's bytes and the debugger with the mapped image.
 - **Reporting:** the loader returns `manifest_sha256`, the SHA-256 of the manifest file's bytes, with the patch ids, for run reports to record.
+
+`input_sha256` is the SHA-256 of the original, unpatched input. Another manifest bound to the same
+input, the CPU translator's `--bind-ranges` range manifest, uses the same hash in lower case, and a
+translator gates both on the original bytes before it translates a patched copy.
 
 ### Shader patches
 
@@ -219,7 +224,46 @@ through the CREATE_PROCESS handle, which is then hashed without its last byte. I
 expected bytes. Each step refuses such a read whatever the memory or the file holds, so the switch
 can only turn a pass into a refusal. The child never sees it.
 
-### Check or plan a manifest
+## Memory patches in the CPU converter
+
+`tools/exe_aot.py <input.exe> <out_dir> --patches <manifest.toml>` translates the same memory
+patches when it [converts an EXE](../experiments.md#converting-an-exe-with-one-command). Its
+stages are header, imports, patches, translate and build. The patches stage does not read the
+input again: it gates the manifest on the bytes the tool read once, plans every patch with the
+rules above, and writes each replacement into a copy at its file offset. The profile's translator
+lifts that copy; the input file is not changed.
+
+- The report's `sha256`, a `--bind-ranges` range manifest and, with `--entry-export`, the
+  `aot_source_sha256` symbol all name the original input. A range manifest written for the patched
+  bytes is refused (`range binding is for another image`).
+- The only profile, `console-stdio`, lifts code and no image data. A patch whose range lies outside
+  an executable section could not change the output, so it is refused (`... which profile
+  console-stdio does not lift (not executable)`).
+- The translator's reads of the copy's section bytes (pefile's `SectionStructure.get_data`, behind
+  every read of the lifter) are recorded. A patch none of whose bytes was read, such as one in
+  padding between functions, could not change the generated source: it is listed in `not_lifted`
+  with its reason and left out of `active`, and a manifest of only such patches gives the same
+  source as no manifest. `active` means read, not used: a lifted function's whole range is read,
+  including bytes it never reaches, and a leaf entry without unwind data owns its whole section.
+- `report.json` holds `"patches": null` or `{"manifest", "manifest_sha256", "active",
+  "not_lifted", "patched_sha256"}` (`not_lifted`: `{"id", "reason"}` per patch; `patched_sha256`:
+  the copy the translator read, every replacement in it), `"bind_ranges"`, and `"patch_line"`:
+  `patches: none`, `patches: manifest sha256=<hex> active=<ids>`, followed by ` not lifted: <n>`
+  when some are not lifted, `patches: none active, manifest sha256=<hex> not lifted: <n>`, or
+  `patches: refused: <reason>`, which the tool prints after a conversion. With `--patches`, a
+  refusal at any later stage gives `patches: refused: not applied, the conversion was refused at
+  the <stage> stage`: at the header or imports stage the manifest was never read, at the translate
+  stage no translation holds the copy (`"patches"` stays null), and at the build stage no EXE
+  exists (`"patches"` describes the generated source, which is kept). A source with an active
+  patch exports `aot_patch_manifest_sha256` and `aot_patched_sha256`. A refusal at the patches
+  stage writes no source and removes a stale one.
+- A `--bind-ranges` file that cannot be read, is not a JSON object, is nested too deeply for the
+  JSON parser or is not a range manifest is refused at the translate stage, with `report.json`
+  written and no source left behind.
+- A profile that translated with image data (`cpu_switch_aot.py --image-data`) would address a
+  live mapping of the input at run time, which would need the same patches. No such profile exists.
+
+## Check or plan a manifest
 
 ```bash
 python3 -B tools/startup/patch_plan.py check <manifest.toml> <input>
@@ -231,7 +275,7 @@ python3 -B tools/startup/patch_plan.py plan <manifest.toml> <input.exe>
 `patches: ok manifest sha256=<hex> patches=<n>` (`plan` adds ` planned`) and exit 0, or print
 `patches: refused: <reason>` and exit 3. A usage error exits 2.
 
-### Test
+## Test
 
 ```bash
 python3 -B tests/patch_plan_check.py
@@ -285,13 +329,39 @@ from `events.txt`: on Windows the probe must be relocated (ASLR). A second build
 so it is relocated on Windows and under Wine and must be patched there too. MSVC's linker may warn
 that this base is below 4 GB; that is the point of the target. The test is in the `pr` presets.
 
+For the CPU converter:
+
+```bash
+python3 -B tests/exe_aot_patch_check.py
+```
+
+Expected result: `Ran 18 tests`, `OK`. A synthetic console EXE returns `0x1357` from its entry, or
+from a function without unwind data that a range manifest binds; the manifest replaces the
+immediate with `0x2468`. The cases check the generated source and the report: the replacement
+constant only with the manifest, the refusals above (wrong input, wrong `expect_sha256`, an import
+address table slot, a `.rdata` range) with no source left behind, a range manifest for the
+original accepted while one for the patched bytes is refused, and a patch in zero bytes of `.text`
+that no function owns listed as not lifted (the recorded reads cover the immediate and not those
+bytes; alone it gives the unpatched source). A translate-stage and a build-stage refusal give the
+refused patch line. With a compiler argument the same
+file builds the conversions and runs them:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_exe_aot_patch$' -V
+```
+
+The converted EXEs exit with `0x1357` unpatched and `0x2468` patched, and the patched EXE exports
+the report's two hashes.
+
 Measured on the planner's earlier copy of the loader, before it moved onto `tools/patch_manifest.py`:
-the Linux check above with Python 3.13, and under Proton Wine the Windows check above, which passed
+the Linux checks above with Python 3.13, and under Proton Wine the Windows check above, which passed
 on a clang-cl build of the probe. The patch line was logged before the first module load in
 `events.txt`, and with the patch moved to the loader breakpoint instead, the TLS copy showed the
 original bytes. The copy with a missing import was patched, ended by Wine's loader before the
 breakpoint and reported `patches: unverified`. Wine's CREATE_PROCESS event carries a file handle the
 debugger can read: the image hashed through it matched the gated EXE, and with the `image` fault the
-run was refused. Not measured: the Windows ordering, the missing-import case and the handle read on
+run was refused. The `cpu_exe_aot_patch` build cases passed with clang-cl 19 and the xwin SDK, run
+under Wine. Not measured: the Windows ordering, the missing-import case and the handle read on
 Windows, an EXE actually replaced between the gate and `CreateProcessW` (the fixture cannot time
-that), and Python older than 3.11.
+that), the `startup_patch_memory` and `cpu_exe_aot_patch` CTests on Windows with MSVC, and Python
+older than 3.11.
